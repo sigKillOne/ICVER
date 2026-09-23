@@ -1,0 +1,19 @@
+# Node
+node_modules/
+.npm/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# MacOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
