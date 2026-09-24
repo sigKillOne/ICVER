@@ -1,5 +1,6 @@
 from typing import Generator
-from sqlalchemy import create_engine
+from datetime import datetime, timezone
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 try:
@@ -20,6 +21,31 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Base class for SQLAlchemy ORM models
 Base = declarative_base()
+
+class FinancialRecord(Base):
+    __tablename__ = "financial_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mobile_number = Column(String(20), unique=True, index=True)
+    upi_monthly_inflow = Column(Float)
+    weekly_txn_frequency = Column(Integer)
+    recharge_regularity_index = Column(Float)
+    days_since_last_txn = Column(Integer)
+    unique_sender_count = Column(Integer, default=0)
+    utility_payment_streak = Column(Integer, default=0)
+    is_gig_worker = Column(Boolean, default=False)
+    gig_rating = Column(Float, nullable=True, default=None)
+    gig_hours_per_week = Column(Integer, nullable=True, default=None)
+
+
+class ScoreHistory(Base):
+    __tablename__ = "score_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mobile_number = Column(String(20), index=True)
+    credit_score = Column(Integer)
+    risk_tier = Column(String(50))
+    calculated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 def get_db() -> Generator[Session, None, None]:

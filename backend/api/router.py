@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, status, Depends
 from sqlalchemy.orm import Session
 
 try:
-    from backend.models.database import get_db
+    from backend.models.database import get_db, FinancialRecord, ScoreHistory
     from backend.schemas.income_verification import (
         ConsentRequest,
         ConsentResponse,
@@ -17,10 +17,10 @@ try:
         ScoringResponse,
         IncomeBreakdown,
     )
-    from backend.ml.train_model import load_artefacts, FEATURE_COLS
+    from backend.ml.train_model import load_artefacts, STANDARD_FEATURES, GIG_FEATURES
     from backend.ml.graph_fraud import detect_circular_inflation
 except ModuleNotFoundError:
-    from models.database import get_db
+    from backend.models.database import get_db, FinancialRecord, ScoreHistory
     from schemas.income_verification import (
         ConsentRequest,
         ConsentResponse,
@@ -28,7 +28,7 @@ except ModuleNotFoundError:
         ScoringResponse,
         IncomeBreakdown,
     )
-    from ml.train_model import load_artefacts, FEATURE_COLS
+    from ml.train_model import load_artefacts, STANDARD_FEATURES, GIG_FEATURES
     from ml.graph_fraud import detect_circular_inflation
 
 logger = logging.getLogger("icver.router")
@@ -39,11 +39,13 @@ router = APIRouter()
 # Load ML artefacts at module-import time (i.e. server startup)
 # ---------------------------------------------------------------------------
 try:
-    _model, _explainer = load_artefacts()
+    _model_standard, _explainer_standard = load_artefacts("standard")
+    _model_gig, _explainer_gig = load_artefacts("gig")
     _ml_ready = True
-    logger.info("ML model and SHAP explainer loaded successfully.")
+    logger.info("Standard and Gig ML models and SHAP explainers loaded successfully.")
 except FileNotFoundError as exc:
-    _model = _explainer = None
+    _model_standard = _explainer_standard = None
+    _model_gig = _explainer_gig = None
     _ml_ready = False
     logger.warning("ML artefacts not found – scoring will fall back to heuristic. %s", exc)
 
@@ -59,53 +61,24 @@ _FEATURE_LABELS = {
     "weekly_txn_frequency": "weekly transaction frequency",
     "recharge_regularity_index": "mobile recharge regularity",
     "days_since_last_txn": "recency of last transaction",
+    "unique_sender_count": "unique senders count",
+    "utility_payment_streak": "utility payment streak",
+    "gig_rating": "gig platform rating",
+    "gig_hours_per_week": "weekly gig hours",
 }
 
 
-def _derive_features(payload: ScoringRequest) -> dict:
+def _predict_and_explain(model, explainer, feature_cols: list[str], features: dict) -> tuple[int, str, list[str], float]:
     """
-    Extract the four model features from the incoming ScoringRequest payload.
-
-    The frontend sends UPI transaction lists, recharge logs, and aggregated
-    numbers.  We derive the features the XGBoost model was trained on.
-    """
-    # UPI monthly inflow – sum of CREDIT transactions, fallback to cashflow avg
-    upi_credits = sum(
-        txn.amount
-        for txn in payload.upi_transaction_history
-        if txn.type.upper() == "CREDIT"
-    )
-    upi_monthly_inflow = upi_credits if upi_credits > 0 else (payload.monthly_cashflow_avg or 28500.0)
-
-    # Weekly transaction frequency – approximate from the list length
-    weekly_txn_frequency = max(len(payload.upi_transaction_history), 1)
-
-    # Recharge regularity index – normalise recharge count to 0-1 range
-    n_recharges = len(payload.mobile_recharge_logs)
-    recharge_regularity_index = min(n_recharges / 4.0, 1.0)  # 4+ recharges → 1.0
-
-    # Days since last transaction – use 3 as a sensible live default
-    days_since_last_txn = 3
-
-    return {
-        "upi_monthly_inflow": upi_monthly_inflow,
-        "weekly_txn_frequency": weekly_txn_frequency,
-        "recharge_regularity_index": recharge_regularity_index,
-        "days_since_last_txn": days_since_last_txn,
-    }
-
-
-def _predict_and_explain(features: dict) -> tuple[int, str, list[str], float]:
-    """
-    Run XGBoost prediction and SHAP explanation.
+    Run XGBoost prediction and SHAP explanation for given model and features.
 
     Returns:
         (score, decision_tier, shap_reasons, confidence)
     """
-    df = pd.DataFrame([features], columns=FEATURE_COLS)
+    df = pd.DataFrame([features], columns=feature_cols)
 
     # --- Prediction ---
-    raw_score = float(_model.predict(df)[0])
+    raw_score = float(model.predict(df)[0])
     score = int(np.clip(round(raw_score), 0, 100))
 
     # --- Decision tier ---
@@ -117,11 +90,11 @@ def _predict_and_explain(features: dict) -> tuple[int, str, list[str], float]:
         decision_tier = "Ineligible"
 
     # --- SHAP explanation ---
-    shap_values = _explainer.shap_values(df)  # shape (1, n_features)
-    sv = shap_values[0]  # first (and only) sample
+    shap_values = explainer.shap_values(df)  # shape (1, n_features)
+    sv = shap_values[0]
 
     # Build human-readable SHAP reasons, sorted by absolute contribution
-    feature_contribs = list(zip(FEATURE_COLS, sv))
+    feature_contribs = list(zip(feature_cols, sv))
     feature_contribs.sort(key=lambda x: abs(x[1]), reverse=True)
 
     shap_reasons = []
@@ -164,6 +137,7 @@ async def create_consent(
     consent_record = ConsentResponse(
         consent_id=consent_id,
         worker_id=payload.worker_id,
+        phone_number=payload.phone_number,
         status="ACTIVE",
         message="Consent successfully granted and logged.",
         created_at=recorded_at
@@ -189,7 +163,7 @@ async def get_consent(consent_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Scoring endpoints – now powered by XGBoost + SHAP
+# Scoring endpoints – now powered by dual XGBoost + SHAP
 # ---------------------------------------------------------------------------
 
 @router.post(
@@ -197,7 +171,7 @@ async def get_consent(consent_id: str):
     response_model=ScoringResponse,
     status_code=status.HTTP_200_OK,
     summary="Calculate informal worker income and creditworthiness score",
-    description="Processes UPI transaction history and mobile recharge logs through an XGBoost model to output a real creditworthiness score, decision tier, and SHAP explanations."
+    description="Processes UPI transaction history and mobile recharge logs through XGBoost models (standard or gig) to output creditworthiness score, decision tier, and SHAP explanations."
 )
 async def calculate_score(
     payload: ScoringRequest,
@@ -212,14 +186,71 @@ async def calculate_score(
                 detail="Provided consent ID is inactive or expired."
             )
 
-    # Derive model features from the request payload
-    features = _derive_features(payload)
+    # --- Query MariaDB for FinancialRecord ---
+    phone_number = payload.phone_number
+    if not phone_number:
+        if payload.consent_id in _consent_db:
+            phone_number = _consent_db[payload.consent_id].phone_number
+
+    if not phone_number:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Phone number is required for scoring."
+        )
+
+    record = db.query(FinancialRecord).filter(FinancialRecord.mobile_number == phone_number).first()
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No financial records found for this mobile number."
+        )
+
+    # --- Conditional Routing based on Employment Type (Gig vs Standard) ---
+    # Extract feature values from payload overrides or record defaults
+    upi_monthly_inflow = payload.upi_monthly_inflow if payload.upi_monthly_inflow is not None else record.upi_monthly_inflow
+    weekly_txn_frequency = payload.weekly_txn_frequency if payload.weekly_txn_frequency is not None else record.weekly_txn_frequency
+    recharge_regularity_index = payload.recharge_regularity_index if payload.recharge_regularity_index is not None else record.recharge_regularity_index
+    days_since_last_txn = payload.days_since_last_txn if payload.days_since_last_txn is not None else record.days_since_last_txn
+    unique_sender_count = payload.unique_sender_count if payload.unique_sender_count is not None else record.unique_sender_count
+    utility_payment_streak = payload.utility_payment_streak if payload.utility_payment_streak is not None else record.utility_payment_streak
+    gig_rating = payload.gig_rating if payload.gig_rating is not None else (record.gig_rating if record.gig_rating is not None else 4.0)
+    gig_hours_per_week = payload.gig_hours_per_week if payload.gig_hours_per_week is not None else (record.gig_hours_per_week if record.gig_hours_per_week is not None else 35)
+
+    # --- Conditional Routing based on Employment Type (Gig vs Standard) ---
+    if record.is_gig_worker:
+        feature_cols = GIG_FEATURES
+        features = {
+            "upi_monthly_inflow": upi_monthly_inflow,
+            "weekly_txn_frequency": weekly_txn_frequency,
+            "recharge_regularity_index": recharge_regularity_index,
+            "days_since_last_txn": days_since_last_txn,
+            "unique_sender_count": unique_sender_count,
+            "utility_payment_streak": utility_payment_streak,
+            "gig_rating": gig_rating,
+            "gig_hours_per_week": gig_hours_per_week,
+        }
+        model = _model_gig
+        explainer = _explainer_gig
+    else:
+        feature_cols = STANDARD_FEATURES
+        features = {
+            "upi_monthly_inflow": upi_monthly_inflow,
+            "weekly_txn_frequency": weekly_txn_frequency,
+            "recharge_regularity_index": recharge_regularity_index,
+            "days_since_last_txn": days_since_last_txn,
+            "unique_sender_count": unique_sender_count,
+            "utility_payment_streak": utility_payment_streak,
+        }
+        model = _model_standard
+        explainer = _explainer_standard
 
     # --- ML Inference or heuristic fallback ---
-    if _ml_ready:
-        score, decision_tier, shap_reasons, confidence = _predict_and_explain(features)
+    if _ml_ready and model is not None and explainer is not None:
+        score, decision_tier, shap_reasons, confidence = _predict_and_explain(
+            model, explainer, feature_cols, features
+        )
     else:
-        # Fallback: simple heuristic (same as old hardcoded logic)
+        # Fallback: simple heuristic
         score = 78
         decision_tier = "Eligible"
         shap_reasons = [
@@ -230,7 +261,7 @@ async def calculate_score(
         confidence = 0.89
 
     # --- Network Fraud Detection ---
-    is_fraud = detect_circular_inflation(payload.worker_id, len(payload.upi_transaction_history))
+    is_fraud = detect_circular_inflation(payload.worker_id, weekly_txn_frequency)
     
     if is_fraud:
         score = int(score * 0.8)
@@ -245,10 +276,8 @@ async def calculate_score(
         decision_tier = "Ineligible"
         
     # --- Income estimation (unchanged business logic) ---
-    upi_credits = sum(
-        txn.amount for txn in payload.upi_transaction_history if txn.type.upper() == "CREDIT"
-    )
-    recharge_total = sum(r.amount for r in payload.mobile_recharge_logs)
+    upi_credits = upi_monthly_inflow
+    recharge_total = recharge_regularity_index * 4.0 * 299.0 # approximate recharge total
 
     cashflow = payload.monthly_cashflow_avg or (upi_credits if upi_credits > 0 else 28500.0)
     gig = payload.gig_platform_earnings or 0.0
@@ -270,6 +299,15 @@ async def calculate_score(
 
     scored_at = datetime.now(timezone.utc)
 
+    # Save score to history
+    score_history = ScoreHistory(
+        mobile_number=phone_number,
+        credit_score=score,
+        risk_tier=decision_tier
+    )
+    db.add(score_history)
+    db.commit()
+
     response = ScoringResponse(
         worker_id=payload.worker_id,
         consent_id=payload.consent_id,
@@ -280,6 +318,11 @@ async def calculate_score(
         confidence_score=confidence,
         risk_category=risk_category,
         synthetic_volume_flag=is_fraud,
+        is_gig_worker=record.is_gig_worker,
+        unique_sender_count=unique_sender_count,
+        utility_payment_streak=utility_payment_streak,
+        gig_rating=gig_rating if record.is_gig_worker else None,
+        gig_hours_per_week=gig_hours_per_week if record.is_gig_worker else None,
         breakdown=IncomeBreakdown(
             base_estimated_income=round(base_estimate, 2),
             gig_income_weight=gig_weight,

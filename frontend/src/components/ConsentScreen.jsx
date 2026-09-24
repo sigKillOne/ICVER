@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Shield, CheckCircle2, Lock, ArrowRight, Smartphone, CreditCard, Layers, AlertCircle } from 'lucide-react';
-import { submitConsent } from '../services/api';
+import { submitConsent, calculateScore } from '../services/api';
 
 export default function ConsentScreen({ onConsentSuccess, savedConsent }) {
   const [workerId, setWorkerId] = useState(savedConsent?.worker_id || 'WRK-7712');
@@ -28,12 +28,32 @@ export default function ConsentScreen({ onConsentSuccess, savedConsent }) {
         consent_purpose: 'Income verification for credit assessment'
       });
 
+      // Verify that records exist for this phone number
+      try {
+        await calculateScore({
+          worker_id: workerId,
+          consent_id: response.consent_id,
+          phone_number: phoneNumber
+        });
+      } catch (scoreErr) {
+        if (scoreErr.message && scoreErr.message.includes('No financial records found')) {
+          setError('No records found for this mobile number.');
+          setLoading(false);
+          return;
+        }
+        throw scoreErr;
+      }
+
       setConsentRecord(response);
       if (onConsentSuccess) {
         onConsentSuccess(response);
       }
     } catch (err) {
-      setError(err.message || 'Failed to submit consent. Ensure FastAPI server is running on port 8000.');
+      if (err.message && err.message.includes('No financial records found')) {
+          setError('No records found for this mobile number.');
+      } else {
+          setError(err.message || 'Failed to submit consent. Ensure FastAPI server is running on port 8000.');
+      }
     } finally {
       setLoading(false);
     }

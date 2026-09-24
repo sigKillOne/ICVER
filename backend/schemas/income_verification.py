@@ -18,6 +18,7 @@ class ConsentRequest(BaseModel):
 class ConsentResponse(BaseModel):
     consent_id: str = Field(..., example="CNS-89472-2026", description="Unique reference ID for recorded consent")
     worker_id: str
+    phone_number: str
     status: str = Field(..., example="ACTIVE", description="Status of consent (ACTIVE, REVOKED, EXPIRED)")
     message: str
     created_at: datetime
@@ -42,6 +43,7 @@ class MobileRechargeLog(BaseModel):
 class ScoringRequest(BaseModel):
     worker_id: str = Field(..., example="WRK-10024")
     consent_id: str = Field(..., example="CNS-89472-2026")
+    phone_number: Optional[str] = Field(default=None, example="9876543210")
     upi_transaction_history: List[UPITransaction] = Field(
         default=[],
         description="List of UPI credit/debit transaction logs"
@@ -52,6 +54,15 @@ class ScoringRequest(BaseModel):
     )
     monthly_cashflow_avg: Optional[float] = Field(default=28500.0, ge=0)
     gig_platform_earnings: Optional[float] = Field(default=15000.0, ge=0)
+    # Simulator feature overrides
+    upi_monthly_inflow: Optional[float] = Field(default=None)
+    weekly_txn_frequency: Optional[int] = Field(default=None)
+    recharge_regularity_index: Optional[float] = Field(default=None)
+    days_since_last_txn: Optional[int] = Field(default=None)
+    unique_sender_count: Optional[int] = Field(default=None)
+    utility_payment_streak: Optional[int] = Field(default=None)
+    gig_rating: Optional[float] = Field(default=None)
+    gig_hours_per_week: Optional[int] = Field(default=None)
 
 
 class IncomeBreakdown(BaseModel):
@@ -78,5 +89,10 @@ class ScoringResponse(BaseModel):
     confidence_score: float = Field(..., ge=0.0, le=1.0, example=0.87)
     risk_category: str = Field(..., example="LOW")
     synthetic_volume_flag: bool = Field(default=False, description="Flag indicating if cyclic synthetic transaction inflation was detected")
+    is_gig_worker: bool = Field(default=False)
+    unique_sender_count: int = Field(default=0)
+    utility_payment_streak: int = Field(default=0)
+    gig_rating: Optional[float] = Field(default=None)
+    gig_hours_per_week: Optional[int] = Field(default=None)
     breakdown: IncomeBreakdown
     scored_at: datetime
