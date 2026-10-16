@@ -37,6 +37,13 @@ class FinancialRecord(Base):
     gig_rating = Column(Float, nullable=True, default=None)
     gig_hours_per_week = Column(Integer, nullable=True, default=None)
 
+    # --- MFI Financial Underwriting Columns (RBI FOIR Compliance) ---
+    monthly_household_income = Column(Float, default=20000.0)
+    monthly_business_expenses = Column(Float, default=8000.0)
+    monthly_household_expenses = Column(Float, default=5000.0)
+    existing_monthly_emi = Column(Float, default=1000.0)
+    proposed_loan_emi = Column(Float, default=1500.0)
+
 
 class ScoreHistory(Base):
     __tablename__ = "score_history"

@@ -41,7 +41,7 @@ export default function App() {
 
                 {/* Worker Routes */}
                 <Route path="/worker/dashboard" element={<ScoreDashboard consentRecord={consentRecord} />} />
-                <Route path="/worker/transactions" element={<TransactionHistory />} />
+                <Route path="/worker/transactions" element={<TransactionHistory consentRecord={consentRecord} />} />
                 <Route path="/worker/loans" element={<LoanOffers />} />
                 <Route path="/worker/settings" element={<Settings />} />
 

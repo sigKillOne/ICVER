@@ -96,3 +96,23 @@ class ScoringResponse(BaseModel):
     gig_hours_per_week: Optional[int] = Field(default=None)
     breakdown: IncomeBreakdown
     scored_at: datetime
+
+    # --- RBI FOIR Compliance Fields ---
+    foir_percentage: float = Field(
+        ...,
+        example=12.0,
+        description="Fixed Obligation to Income Ratio: (existing_emi + proposed_emi) / household_income × 100"
+    )
+    available_surplus: float = Field(
+        ...,
+        example=7000.0,
+        description="Monthly surplus after all obligations: income − (biz expenses + household expenses + existing EMI + proposed EMI)"
+    )
+    rbi_compliant: bool = Field(
+        ...,
+        description="True if FOIR ≤ 50% (RBI Guardrail). False triggers High Risk override."
+    )
+    rbi_max_cap: float = Field(
+        default=50.0,
+        description="RBI mandated maximum FOIR cap for MFI lending (fixed at 50%)"
+    )

@@ -274,6 +274,32 @@ async def calculate_score(
         decision_tier = "Review"
     else:
         decision_tier = "Ineligible"
+
+    # --- RBI FOIR Guardrail (MFI Regulatory Compliance) ---
+    monthly_household_income = record.monthly_household_income or 1.0  # guard against zero-division
+    monthly_business_expenses = record.monthly_business_expenses or 0.0
+    monthly_household_expenses = record.monthly_household_expenses or 0.0
+    existing_monthly_emi = record.existing_monthly_emi or 0.0
+    proposed_loan_emi = record.proposed_loan_emi or 0.0
+
+    foir_percentage = round(
+        ((existing_monthly_emi + proposed_loan_emi) / monthly_household_income) * 100, 2
+    )
+    available_surplus = round(
+        monthly_household_income
+        - (monthly_business_expenses + monthly_household_expenses + existing_monthly_emi + proposed_loan_emi),
+        2,
+    )
+    rbi_max_cap = 50.0
+
+    if foir_percentage > rbi_max_cap:
+        rbi_compliant = False
+        decision_tier = "High Risk"
+        shap_reasons = [
+            f"RBI Guardrail Violation: Household Debt Burden exceeds 50% Cap (FOIR = {foir_percentage:.1f}%)"
+        ] + shap_reasons
+    else:
+        rbi_compliant = True
         
     # --- Income estimation (unchanged business logic) ---
     upi_credits = upi_monthly_inflow
@@ -299,14 +325,21 @@ async def calculate_score(
 
     scored_at = datetime.now(timezone.utc)
 
-    # Save score to history
+    # Save score to history (includes FOIR compliance audit note in risk_tier)
+    audit_tier = (
+        f"{decision_tier} | FOIR={foir_percentage:.1f}% | RBI={'OK' if rbi_compliant else 'VIOLATION'}"
+    )
     score_history = ScoreHistory(
         mobile_number=phone_number,
         credit_score=score,
-        risk_tier=decision_tier
+        risk_tier=audit_tier
     )
     db.add(score_history)
     db.commit()
+
+    # --- Risk category from ML score (FOIR override may have changed decision_tier) ---
+    if not rbi_compliant:
+        risk_category = "HIGH"
 
     response = ScoringResponse(
         worker_id=payload.worker_id,
@@ -329,7 +362,12 @@ async def calculate_score(
             cashflow_stability_index=stability_index,
             risk_factor=risk_factor
         ),
-        scored_at=scored_at
+        scored_at=scored_at,
+        # RBI FOIR compliance fields
+        foir_percentage=foir_percentage,
+        available_surplus=available_surplus,
+        rbi_compliant=rbi_compliant,
+        rbi_max_cap=rbi_max_cap,
     )
 
     _scores_db[payload.worker_id] = response
