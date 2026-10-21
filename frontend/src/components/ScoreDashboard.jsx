@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   Award, Zap, CheckCircle, RefreshCw, AlertCircle,
   Lightbulb, Users, CalendarCheck, Star, Clock, Briefcase, BarChart3,
-  ShieldCheck, ShieldAlert, Landmark, Building2, Wallet, Scale, CheckCircle2, XCircle
+  ShieldCheck, ShieldAlert, Landmark, Building2, Wallet, Scale, CheckCircle2, XCircle, Percent
 } from 'lucide-react';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -81,6 +81,11 @@ export default function ScoreDashboard({ consentRecord }) {
   const availableSurplus = scoreData?.available_surplus ?? 7000.0;
   const rbiCompliant = scoreData?.rbi_compliant ?? true;
   const rbiMaxCap = scoreData?.rbi_max_cap ?? 50.0;
+
+  // --- Dynamic Risk-Based Pricing Engine Fields ---
+  const interestRateApr = scoreData?.interest_rate_apr ?? 0.0;
+  const maxLoanLimit = scoreData?.max_loan_limit ?? 0.0;
+  const estimatedEmi = scoreData?.estimated_emi ?? 0.0;
 
   // --- Institutional Partner Match Logic (Karnataka MFI / SFB Ecosystem) ---
   const getPartnerMatch = () => {
@@ -452,8 +457,154 @@ export default function ScoreDashboard({ consentRecord }) {
           </div>
         </motion.div>
 
+        {/* Risk-Based Pricing Offer Card */}
+        <motion.div
+          variants={itemVariants}
+          className="glass-card grid-col-7"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'space-between',
+            ...(rbiCompliant
+              ? { borderTop: '3px solid var(--accent)' }
+              : {
+                  opacity: 0.65,
+                  background: '#f5f5f4',
+                  border: '1px dashed #d6d3d1'
+                })
+          }}
+        >
+          <div>
+            <div className="card-header">
+              <h3 className="card-title">
+                <Percent size={14} color={rbiCompliant ? "var(--accent)" : "var(--text-tertiary)"} /> Risk-Based Pricing Offer
+              </h3>
+              <span
+                className="badge"
+                style={
+                  rbiCompliant
+                    ? { background: 'var(--accent-subtle)', color: 'var(--accent)', border: '1px solid #ccfbf1' }
+                    : { background: 'var(--danger-subtle)', color: 'var(--danger)', border: '1px solid #fecaca' }
+                }
+              >
+                {rbiCompliant ? <CheckCircle2 size={10} /> : <XCircle size={10} />}
+                {rbiCompliant ? 'PRE-APPROVED PRICING' : 'OFFER UNAVAILABLE'}
+              </span>
+            </div>
+
+            {rbiCompliant ? (
+              <>
+                {/* Metric Highlights Grid */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginTop: '8px', marginBottom: '14px' }}>
+                  {/* Approved APR */}
+                  <div style={{ background: 'var(--bg-page)', border: '1px solid var(--border)', padding: '14px' }}>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, marginBottom: '4px' }}>
+                      Approved APR (%)
+                    </div>
+                    <div style={{ fontSize: '26px', fontWeight: 700, fontFamily: 'var(--font-mono)', color: 'var(--accent)' }}>
+                      {loading ? '—' : `${interestRateApr.toFixed(1)}%`}
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                      Tier: {scoreVal >= 80 ? 'Prime / Excellent (12.5%)' : scoreVal >= 60 ? 'Standard MFI (18.0%)' : 'Subprime (24.0%)'}
+                    </div>
+                  </div>
+
+                  {/* Maximum Sanction Limit */}
+                  <div style={{ background: 'var(--bg-page)', border: '1px solid var(--border)', padding: '14px' }}>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, marginBottom: '4px' }}>
+                      Maximum Sanction Limit (₹)
+                    </div>
+                    <div style={{ fontSize: '26px', fontWeight: 700, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
+                      {loading ? '—' : `₹${Math.round(maxLoanLimit).toLocaleString('en-IN')}`}
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                      12-Month Conservative Surplus Buffer
+                    </div>
+                  </div>
+                </div>
+
+                {/* Quick Summary Callout */}
+                <div style={{
+                  background: 'var(--accent-subtle)',
+                  border: '1px solid #ccfbf1',
+                  borderLeft: '4px solid var(--accent)',
+                  padding: '12px 16px',
+                  marginBottom: '10px'
+                }}>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent)', lineHeight: 1.5 }}>
+                    Estimated EMI for ₹50,000 over 12 months: ₹{estimatedEmi}
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                    Calculated using standard annuity amortisation formula at {interestRateApr.toFixed(1)}% APR.
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                {/* Non-Compliant / Greyed-out State Content */}
+                <div style={{
+                  background: '#fecaca30',
+                  border: '1px solid #fca5a5',
+                  borderLeft: '4px solid var(--danger)',
+                  padding: '14px 16px',
+                  marginTop: '8px',
+                  marginBottom: '14px'
+                }}>
+                  <div style={{ fontSize: '13px', fontWeight: 700, color: 'var(--danger)', marginBottom: '4px' }}>
+                    Offer Unavailable
+                  </div>
+                  <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                    Lending restricted under RBI 50% FOIR statutory ceiling. Total monthly obligations consume {foirPercentage.toFixed(1)}% of household income. Deleveraging required before fresh credit sanctions can be approved.
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '14px' }}>
+                  <div style={{ background: '#f5f5f4', border: '1px solid #e7e5e4', padding: '14px' }}>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, marginBottom: '4px' }}>
+                      Approved APR (%)
+                    </div>
+                    <div style={{ fontSize: '24px', fontWeight: 700, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)' }}>
+                      0.0%
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
+                      Pricing Disabled (Non-Compliant)
+                    </div>
+                  </div>
+
+                  <div style={{ background: '#f5f5f4', border: '1px solid #e7e5e4', padding: '14px' }}>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, marginBottom: '4px' }}>
+                      Maximum Sanction Limit (₹)
+                    </div>
+                    <div style={{ fontSize: '24px', fontWeight: 700, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)' }}>
+                      ₹0.00
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
+                      Zero Sanction Permitted
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{
+                  background: '#f5f5f4',
+                  border: '1px solid #e7e5e4',
+                  padding: '10px 14px',
+                  fontSize: '12px',
+                  color: 'var(--text-tertiary)',
+                  marginBottom: '10px'
+                }}>
+                  Estimated EMI for ₹50,000 over 12 months: ₹{estimatedEmi}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)', borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
+            Risk-based pricing matrix calculated via XGBoost score tiers and RBI debt service buffer.
+          </div>
+        </motion.div>
+
         {/* Institutional Partner Match Card */}
-        <motion.div variants={itemVariants} className="glass-card grid-col-7" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+        <motion.div variants={itemVariants} className="glass-card grid-col-12" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
           <div>
             <div className="card-header">
               <h3 className="card-title">
@@ -492,7 +643,7 @@ export default function ScoreDashboard({ consentRecord }) {
             </div>
 
             {/* Karnataka Institutional Ecosystem Grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '10px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '10px' }}>
               <div style={{
                 padding: '10px 12px',
                 background: 'var(--bg-page)',

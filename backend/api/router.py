@@ -19,6 +19,7 @@ try:
     )
     from backend.ml.train_model import load_artefacts, STANDARD_FEATURES, GIG_FEATURES
     from backend.ml.graph_fraud import detect_circular_inflation
+    from backend.core.parser import extract_upi_inflow
 except ModuleNotFoundError:
     from backend.models.database import get_db, FinancialRecord, ScoreHistory
     from schemas.income_verification import (
@@ -30,6 +31,7 @@ except ModuleNotFoundError:
     )
     from ml.train_model import load_artefacts, STANDARD_FEATURES, GIG_FEATURES
     from ml.graph_fraud import detect_circular_inflation
+    from core.parser import extract_upi_inflow
 
 logger = logging.getLogger("icver.router")
 
@@ -207,7 +209,16 @@ async def calculate_score(
 
     # --- Conditional Routing based on Employment Type (Gig vs Standard) ---
     # Extract feature values from payload overrides or record defaults
-    upi_monthly_inflow = payload.upi_monthly_inflow if payload.upi_monthly_inflow is not None else record.upi_monthly_inflow
+    upi_monthly_inflow = float(payload.upi_monthly_inflow if payload.upi_monthly_inflow is not None else (record.upi_monthly_inflow or 0.0))
+    monthly_household_income = float(record.monthly_household_income or 0.0)
+
+    # --- Unstructured Data Ingestion: Parse Raw SMS Transaction Logs ---
+    if payload.sms_log:
+        sms_inflow = extract_upi_inflow(payload.sms_log)
+        upi_monthly_inflow += sms_inflow
+        monthly_household_income += sms_inflow
+        logger.info("Unstructured SMS ingestion extracted ₹%.2f from SMS log", sms_inflow)
+
     weekly_txn_frequency = payload.weekly_txn_frequency if payload.weekly_txn_frequency is not None else record.weekly_txn_frequency
     recharge_regularity_index = payload.recharge_regularity_index if payload.recharge_regularity_index is not None else record.recharge_regularity_index
     days_since_last_txn = payload.days_since_last_txn if payload.days_since_last_txn is not None else record.days_since_last_txn
@@ -276,14 +287,14 @@ async def calculate_score(
         decision_tier = "Ineligible"
 
     # --- RBI FOIR Guardrail (MFI Regulatory Compliance) ---
-    monthly_household_income = record.monthly_household_income or 1.0  # guard against zero-division
+    effective_income = monthly_household_income if monthly_household_income > 0 else 1.0  # guard against zero-division
     monthly_business_expenses = record.monthly_business_expenses or 0.0
     monthly_household_expenses = record.monthly_household_expenses or 0.0
     existing_monthly_emi = record.existing_monthly_emi or 0.0
     proposed_loan_emi = record.proposed_loan_emi or 0.0
 
     foir_percentage = round(
-        ((existing_monthly_emi + proposed_loan_emi) / monthly_household_income) * 100, 2
+        ((existing_monthly_emi + proposed_loan_emi) / effective_income) * 100, 2
     )
     available_surplus = round(
         monthly_household_income
@@ -341,6 +352,33 @@ async def calculate_score(
     if not rbi_compliant:
         risk_category = "HIGH"
 
+    # --- Dynamic Risk-Based Pricing Engine ---
+    if not rbi_compliant or decision_tier == "High Risk" or risk_category == "HIGH":
+        interest_rate_apr = 0.0
+        max_loan_limit = 0.0
+        estimated_emi = 0.0
+    else:
+        if score >= 80:
+            interest_rate_apr = 12.5
+        elif score >= 60:
+            interest_rate_apr = 18.0
+        else:
+            interest_rate_apr = 24.0
+
+        max_loan_limit = round(max(0.0, available_surplus * 12.0), 2)
+
+        # Calculate standard EMI for baseline ₹50,000 loan over 12 months:
+        # EMI = P * r * (1+r)^n / ((1+r)^n - 1)
+        p = 50000.0
+        n = 12
+        r = (interest_rate_apr / 100.0) / 12.0
+        if r > 0:
+            numerator = p * r * ((1.0 + r) ** n)
+            denominator = ((1.0 + r) ** n) - 1.0
+            estimated_emi = round(numerator / denominator, 2)
+        else:
+            estimated_emi = 0.0
+
     response = ScoringResponse(
         worker_id=payload.worker_id,
         consent_id=payload.consent_id,
@@ -368,6 +406,10 @@ async def calculate_score(
         available_surplus=available_surplus,
         rbi_compliant=rbi_compliant,
         rbi_max_cap=rbi_max_cap,
+        # Risk-based pricing fields
+        interest_rate_apr=interest_rate_apr,
+        max_loan_limit=max_loan_limit,
+        estimated_emi=estimated_emi,
     )
 
     _scores_db[payload.worker_id] = response

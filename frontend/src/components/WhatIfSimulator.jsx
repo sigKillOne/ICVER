@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Sliders, TrendingUp, RefreshCw, Star, Clock, Users, CalendarCheck, Zap } from 'lucide-react';
+import { Sliders, TrendingUp, RefreshCw, Star, Clock, Users, CalendarCheck, MessageSquare } from 'lucide-react';
 import { calculateScore } from '../services/api';
 
 export default function WhatIfSimulator({ scoreData, workerId, consentId, phoneNumber }) {
@@ -14,6 +14,9 @@ export default function WhatIfSimulator({ scoreData, workerId, consentId, phoneN
   const [streak, setStreak] = useState( scoreData?.utility_payment_streak ?? 6 );
   const [gigRating, setGigRating] = useState( scoreData?.gig_rating ?? 4.8 );
   const [gigHours, setGigHours] = useState( scoreData?.gig_hours_per_week ?? 40 );
+
+  // Unstructured SMS Log state
+  const [smsLog, setSmsLog] = useState('');
 
   const [predictedScore, setPredictedScore] = useState(currentScore);
   const [loading, setLoading] = useState(false);
@@ -30,13 +33,14 @@ export default function WhatIfSimulator({ scoreData, workerId, consentId, phoneN
   }, [scoreData]);
 
   // Debounced API score prediction calculation
-  const runSimulation = useCallback(async (vals) => {
+  const runSimulation = useCallback(async (vals, currentSmsLog = smsLog) => {
     setLoading(true);
     try {
       const payload = {
         worker_id: workerId || 'WRK-7712',
         consent_id: consentId || 'CNS-DEMO-2026',
         phone_number: phoneNumber || '9876543210',
+        sms_log: currentSmsLog,
         upi_monthly_inflow: vals.inflow,
         weekly_txn_frequency: vals.freq,
         recharge_regularity_index: vals.regularity,
@@ -64,7 +68,7 @@ export default function WhatIfSimulator({ scoreData, workerId, consentId, phoneN
     } finally {
       setLoading(false);
     }
-  }, [workerId, consentId, phoneNumber, isGig]);
+  }, [workerId, consentId, phoneNumber, isGig, smsLog]);
 
   const handleChange = (setter, key, val) => {
     setter(val);
@@ -72,7 +76,14 @@ export default function WhatIfSimulator({ scoreData, workerId, consentId, phoneN
       inflow, freq, regularity, recency, senders, streak, gigRating, gigHours,
       [key]: val
     };
-    runSimulation(updatedValues);
+    runSimulation(updatedValues, smsLog);
+  };
+
+  const handleSyncLogs = () => {
+    const currentValues = {
+      inflow, freq, regularity, recency, senders, streak, gigRating, gigHours
+    };
+    runSimulation(currentValues, smsLog);
   };
 
   const scoreDiff = predictedScore - currentScore;
@@ -284,6 +295,85 @@ export default function WhatIfSimulator({ scoreData, workerId, consentId, phoneN
           </>
         )}
 
+      </div>
+
+      {/* Alternative Data Sync (Unstructured) Area */}
+      <div style={{
+        marginTop: '24px',
+        paddingTop: '20px',
+        borderTop: '1px solid var(--border)'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', flexWrap: 'wrap', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <MessageSquare size={16} color="var(--accent)" />
+            <h4 style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: 'var(--text-primary)' }}>
+              Alternative Data Sync (Unstructured)
+            </h4>
+          </div>
+          <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>
+            Automated Regex Inflow Aggregation
+          </span>
+        </div>
+
+        <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px', lineHeight: 1.5 }}>
+          Paste raw SMS transaction logs, informal credit alerts, or mobile banking receipts. The parser extracts incoming credits and adds them directly to your verified monthly inflow and household income.
+        </p>
+
+        <textarea
+          value={smsLog}
+          onChange={(e) => setSmsLog(e.target.value)}
+          placeholder='Paste raw SMS banking alerts here... (e.g., "Credited Rs. 500 via UPI")'
+          rows={3}
+          style={{
+            width: '100%',
+            minHeight: '80px',
+            padding: '10px 12px',
+            background: 'var(--bg-page)',
+            border: '1px solid var(--border)',
+            borderRadius: '0',
+            color: 'var(--text-primary)',
+            fontFamily: 'var(--font-mono)',
+            fontSize: '12px',
+            lineHeight: 1.5,
+            resize: 'vertical',
+            outline: 'none',
+            boxSizing: 'border-box'
+          }}
+        />
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '12px', flexWrap: 'wrap', gap: '10px' }}>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setSmsLog('Credited Rs. 2,500.00 on 24-Sep by UPI. Received INR 1050.50 from client. Rs.500 credited via PhonePe.')}
+              style={{ fontSize: '11px', padding: '4px 10px' }}
+            >
+              Load Sample SMS Dump
+            </button>
+            {smsLog && (
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setSmsLog('')}
+                style={{ fontSize: '11px', padding: '4px 10px' }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={handleSyncLogs}
+            disabled={loading}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+          >
+            <RefreshCw size={13} className={loading ? 'animate-pulse' : ''} />
+            Sync Logs & Recalculate
+          </button>
+        </div>
       </div>
     </div>
   );

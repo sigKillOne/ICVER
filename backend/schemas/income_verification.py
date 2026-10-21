@@ -44,6 +44,11 @@ class ScoringRequest(BaseModel):
     worker_id: str = Field(..., example="WRK-10024")
     consent_id: str = Field(..., example="CNS-89472-2026")
     phone_number: Optional[str] = Field(default=None, example="9876543210")
+    sms_log: Optional[str] = Field(
+        default=None,
+        example="Credited Rs. 500 on 24-Sep by UPI. Received INR 1050.50.",
+        description="Raw SMS transaction dump for unstructured inflow extraction"
+    )
     upi_transaction_history: List[UPITransaction] = Field(
         default=[],
         description="List of UPI credit/debit transaction logs"
@@ -115,4 +120,21 @@ class ScoringResponse(BaseModel):
     rbi_max_cap: float = Field(
         default=50.0,
         description="RBI mandated maximum FOIR cap for MFI lending (fixed at 50%)"
+    )
+
+    # --- Dynamic Risk-Based Pricing Engine Fields ---
+    interest_rate_apr: float = Field(
+        default=0.0,
+        example=12.5,
+        description="Approved risk-based Annual Percentage Rate (%)"
+    )
+    max_loan_limit: float = Field(
+        default=0.0,
+        example=84000.0,
+        description="Maximum sanction limit based on 12-month available surplus capacity"
+    )
+    estimated_emi: float = Field(
+        default=0.0,
+        example=4454.89,
+        description="Estimated monthly EMI for baseline ₹50,000 loan over 12 months"
     )
