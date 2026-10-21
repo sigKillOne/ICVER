@@ -17,3 +17,8 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Data
+backend/data/raw/
+backend/data/processed/
+backend/data/*.md
