@@ -42,6 +42,11 @@ try:
         SmsSummary,
         VerifyRequest,
         VerifyResponse,
+        WhatIfBaselineSummary,
+        WhatIfDeltas,
+        WhatIfRequest,
+        WhatIfResponse,
+        WhatIfScenarioSummary,
     )
 except ModuleNotFoundError:  # pragma: no cover - flat module execution fallback
     from core import risk_v2
@@ -74,6 +79,11 @@ except ModuleNotFoundError:  # pragma: no cover - flat module execution fallback
         SmsSummary,
         VerifyRequest,
         VerifyResponse,
+        WhatIfBaselineSummary,
+        WhatIfDeltas,
+        WhatIfRequest,
+        WhatIfResponse,
+        WhatIfScenarioSummary,
     )
 
 ENGINE_VERSION = "income-verification-engine-v1"  # Module path/version of the engine.
@@ -161,6 +171,22 @@ REFERENCE_POPULATION_NOTE = (
     "The model was validated on applicants with credit history; its accuracy for "
     "profiles with no credit history is unproven."
 )
+DEMO_RISK_SOURCE_PREFIX = "home_credit_heldout_row"
+DEMO_DATA_NOTICE = (
+    "Demonstration worker: risk features come from a held-out row of a public, "
+    "non-Indian dataset; UPI evidence is simulated."
+)
+WHAT_IF_BASELINE_NOTE = (
+    "Baseline uses the worker's stored evidence without hypothetical overrides."
+)
+WHAT_IF_SCENARIO_NOTE = (
+    "Scenario evidence is hypothetical and has not been verified."
+)
+WHAT_IF_STORED_UPI_NOTE = (
+    "No hypothetical UPI series was supplied; the scenario uses stored UPI evidence."
+)
+
+UpiSeriesOverride = Tuple[List[str], List[float], List[int], bool]
 
 
 def compute_affordability(
@@ -450,7 +476,7 @@ def _fetch_worker(db: Session, phone_number: str) -> FinancialRecord:
 
 def _build_risk_signal(
     db: Session, worker_id: str, request: VerifyRequest
-) -> tuple[Dict[str, Any], Dict[str, Any]]:
+) -> tuple[Dict[str, Any], Dict[str, Any], Optional[str]]:
     profile = (
         db.query(WorkerRiskProfile)
         .filter(WorkerRiskProfile.worker_id == worker_id)
@@ -460,8 +486,15 @@ def _build_risk_signal(
         return (
             RiskSignalSummary(available=False, reason=RISK_UNAVAILABLE_REASON).model_dump(),
             {"available": False, "reason": RISK_UNAVAILABLE_REASON},
+            None,
         )
 
+    profile_source = str(profile.source or "")
+    data_notice = (
+        DEMO_DATA_NOTICE
+        if profile_source.startswith(DEMO_RISK_SOURCE_PREFIX)
+        else None
+    )
     features = dict(profile.features or {})
     if request.tenure_months is not None:
         # credit_term_months is the one model feature a request may supply.
@@ -476,6 +509,7 @@ def _build_risk_signal(
         return (
             RiskSignalSummary(available=False, reason=reason).model_dump(),
             {"available": False, "reason": reason},
+            data_notice,
         )
 
     factors_raising = [RiskFactor(**item) for item in explanation["raising_risk"]]
@@ -501,11 +535,23 @@ def _build_risk_signal(
         "risk_score_0_100": prediction["risk_score_0_100"],
         "reliability": summary["reliability"],
     }
-    return full_signal.model_dump(), compact
+    return full_signal.model_dump(), compact, data_notice
 
 
-def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
-    """Run the deterministic verification, risk and recommendation pipeline."""
+def run_verification(
+    db: Session,
+    request: VerifyRequest,
+    *,
+    persist: bool = True,
+    upi_override: Optional[UpiSeriesOverride] = None,
+    now_utc: Optional[datetime] = None,
+) -> VerifyResponse:
+    """Run the deterministic verification, risk and recommendation pipeline.
+
+    ``persist=False`` is used by what-if and demo tooling so the same computation can
+    run without writing a verification result. ``upi_override`` substitutes the stored
+    UPI monthly series for hypothetical scenarios.
+    """
     if not risk_v2.is_loaded():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -522,13 +568,16 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
     )
     record = _fetch_worker(db, phone_number)
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = now_utc or datetime.now(timezone.utc)
     fallback_month_key = now_utc.astimezone(INDIA_TIMEZONE).strftime(
         SMS_MONTH_KEY_FORMAT
     )
-    upi_month_keys, upi_inflows, upi_senders, used_fallback = _load_upi_evidence(
-        db, request.worker_id, record, fallback_month_key
-    )
+    if upi_override is None:
+        upi_month_keys, upi_inflows, upi_senders, used_fallback = _load_upi_evidence(
+            db, request.worker_id, record, fallback_month_key
+        )
+    else:
+        upi_month_keys, upi_inflows, upi_senders, used_fallback = upi_override
     upi_by_month = dict(zip(upi_month_keys, upi_inflows))
     sms_series, upi_series, sms_summary, sms_provenance, sms_ignored_reason = (
         _build_sms_evidence(request.sms_log, now_utc, upi_by_month)
@@ -573,7 +622,7 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
     affordability_for_recommendation["sms_provenance"] = sms_provenance
     affordability_for_recommendation["upi_provenance"] = upi_provenance
 
-    risk_signal, risk_for_recommendation = _build_risk_signal(
+    risk_signal, risk_for_recommendation, data_notice = _build_risk_signal(
         db, request.worker_id, request
     )
     recommendation = recommend(
@@ -624,18 +673,129 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
         model_version=risk_v2.model_version() or "unknown",
         engine_version=ENGINE_VERSION,
         sms_ignored_reason=sms_ignored_reason,
+        data_notice=data_notice,
     )
 
-    stored = VerificationResultRecord(
-        id=verification_id,
-        worker_id=request.worker_id,
-        consent_id=consent.id,
-        result=response.model_dump(mode="json"),
-        created_at=created_at,
-    )
-    db.add(stored)
-    db.commit()
+    if persist:
+        stored = VerificationResultRecord(
+            id=verification_id,
+            worker_id=request.worker_id,
+            consent_id=consent.id,
+            result=response.model_dump(mode="json"),
+            created_at=created_at,
+        )
+        db.add(stored)
+        db.commit()
     return response
+
+
+def _hypothetical_month_keys(count: int, now_utc: datetime) -> List[str]:
+    """Return recent IST month keys, oldest first, for a hypothetical UPI series."""
+    current_month = now_utc.astimezone(INDIA_TIMEZONE).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    return [
+        _subtract_months(current_month, offset).strftime(SMS_MONTH_KEY_FORMAT)
+        for offset in reversed(range(count))
+    ]
+
+
+def _delta(
+    scenario_value: Optional[float], baseline_value: Optional[float]
+) -> Optional[float]:
+    if scenario_value is None or baseline_value is None:
+        return None
+    return scenario_value - baseline_value
+
+
+def run_what_if(db: Session, request: WhatIfRequest) -> WhatIfResponse:
+    """Compare stored evidence with a hypothetical scenario without persisting either."""
+    now_utc = datetime.now(timezone.utc)
+
+    baseline_request = VerifyRequest(
+        worker_id=request.worker_id,
+        consent_id=request.consent_id,
+        phone_number=request.phone_number,
+    )
+    baseline = run_verification(
+        db, baseline_request, persist=False, now_utc=now_utc
+    )
+
+    upi_override: Optional[UpiSeriesOverride] = None
+    inflows = request.hypothetical_upi_monthly_inflows
+    if inflows is not None:
+        upi_override = (
+            _hypothetical_month_keys(len(inflows), now_utc),
+            list(inflows),
+            list(request.hypothetical_unique_senders or []),
+            False,
+        )
+
+    scenario_request = VerifyRequest(
+        worker_id=request.worker_id,
+        consent_id=request.consent_id,
+        phone_number=request.phone_number,
+        stated_monthly_income=request.stated_monthly_income,
+        monthly_outgoings=request.monthly_outgoings,
+        household_size=request.household_size,
+        proposed_emi=request.proposed_emi,
+        tenure_months=request.tenure_months,
+    )
+    scenario = run_verification(
+        db,
+        scenario_request,
+        persist=False,
+        upi_override=upi_override,
+        now_utc=now_utc,
+    )
+
+    baseline_summary = WhatIfBaselineSummary(
+        income_low=baseline.income.low,
+        income_mid=baseline.income.mid,
+        surplus_conservative=baseline.surplus_conservative,
+        confidence_score=baseline.evidence.confidence_score,
+        confidence_level=baseline.evidence.confidence_level,
+        max_affordable_emi=baseline.affordability.max_affordable_emi,
+        recommendation_code=baseline.recommendation.code,
+        flags=baseline.evidence.flags,
+    )
+    scenario_summary = WhatIfScenarioSummary(
+        income_low=scenario.income.low,
+        income_mid=scenario.income.mid,
+        surplus_conservative=scenario.surplus_conservative,
+        confidence_score=scenario.evidence.confidence_score,
+        confidence_level=scenario.evidence.confidence_level,
+        max_affordable_emi=scenario.affordability.max_affordable_emi,
+        hypothetical_recommendation_code=scenario.recommendation.code,
+        flags=scenario.evidence.flags,
+    )
+
+    notes = [WHAT_IF_BASELINE_NOTE, WHAT_IF_SCENARIO_NOTE]
+    if inflows is None:
+        notes.append(WHAT_IF_STORED_UPI_NOTE)
+
+    return WhatIfResponse(
+        hypothetical=True,
+        baseline=baseline_summary,
+        scenario=scenario_summary,
+        deltas=WhatIfDeltas(
+            income_low=_delta(scenario.income.low, baseline.income.low),
+            surplus=_delta(
+                scenario.surplus_conservative, baseline.surplus_conservative
+            ),
+            max_affordable_emi=_delta(
+                scenario.affordability.max_affordable_emi,
+                baseline.affordability.max_affordable_emi,
+            ),
+            confidence_score=_delta(
+                scenario.evidence.confidence_score,
+                baseline.evidence.confidence_score,
+            ),
+        ),
+        notes=notes,
+        data_notice=scenario.data_notice or baseline.data_notice,
+        disclaimer=scenario.disclaimer,
+    )
 
 
 def get_stored_verification(

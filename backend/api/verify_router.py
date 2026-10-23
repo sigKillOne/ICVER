@@ -9,16 +9,28 @@ try:
     from backend.core.verification_pipeline import (
         get_stored_verification,
         run_verification,
+        run_what_if,
     )
     from backend.models.database import get_db
-    from backend.schemas.verification import VerifyRequest, VerifyResponse
+    from backend.schemas.verification import (
+        VerifyRequest,
+        VerifyResponse,
+        WhatIfRequest,
+        WhatIfResponse,
+    )
 except ModuleNotFoundError:  # pragma: no cover - flat module execution fallback
     from core.verification_pipeline import (
         get_stored_verification,
         run_verification,
+        run_what_if,
     )
     from models.database import get_db
-    from schemas.verification import VerifyRequest, VerifyResponse
+    from schemas.verification import (
+        VerifyRequest,
+        VerifyResponse,
+        WhatIfRequest,
+        WhatIfResponse,
+    )
 
 router = APIRouter()
 
@@ -39,6 +51,24 @@ def verify_worker(
     db: Session = Depends(get_db),
 ) -> VerifyResponse:
     return run_verification(db, payload)
+
+
+@router.post(
+    "/verify/what-if",
+    response_model=WhatIfResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Preview a hypothetical verification scenario without persisting it",
+    description=(
+        "Compares stored evidence with optional hypothetical inputs. Nothing is "
+        "persisted and the scenario can never be retrieved later. ICVER does not "
+        "approve or reject credit."
+    ),
+)
+def what_if(
+    payload: WhatIfRequest,
+    db: Session = Depends(get_db),
+) -> WhatIfResponse:
+    return run_what_if(db, payload)
 
 
 @router.get(

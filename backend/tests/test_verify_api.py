@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -186,6 +186,16 @@ def payload(**overrides):
         "occupation_type": "Test worker",
         "proposed_emi": 1000.0,
         "tenure_months": 24,
+    }
+    data.update(overrides)
+    return data
+
+
+def what_if_payload(**overrides):
+    data = {
+        "worker_id": WORKER,
+        "consent_id": CONSENT,
+        "phone_number": PHONE,
     }
     data.update(overrides)
     return data
@@ -1020,3 +1030,278 @@ def test_health_reports_risk_v2_status(client):
     body = response.json()
     assert body["risk_v2"]["loaded"] is True
     assert "error" in body["risk_v2"]
+
+
+# ---------------------------------------------------------------------------
+# What-if scenarios
+# ---------------------------------------------------------------------------
+def test_what_if_missing_consent_returns_403(client, db_session):
+    seed_full(db_session)
+    body = what_if_payload()
+    body.pop("consent_id")
+    response = client.post("/api/v1/verify/what-if", json=body)
+    assert response.status_code == 403
+
+
+def test_what_if_unknown_consent_returns_403(client, db_session):
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(consent_id="CNS-NOT-REAL"),
+    )
+    assert response.status_code == 403
+    assert "unknown consent_id" in response.json()["detail"].lower()
+
+
+def test_what_if_revoked_consent_returns_403(client, db_session):
+    add_consent(db_session, revoked=True)
+    add_record(db_session)
+    add_months(db_session)
+    add_profile(db_session)
+    response = client.post("/api/v1/verify/what-if", json=what_if_payload())
+    assert response.status_code == 403
+    assert "revoked" in response.json()["detail"].lower()
+
+
+def test_what_if_expired_consent_returns_403(client, db_session):
+    add_consent(db_session, expired=True)
+    add_record(db_session)
+    add_months(db_session)
+    add_profile(db_session)
+    response = client.post("/api/v1/verify/what-if", json=what_if_payload())
+    assert response.status_code == 403
+    assert "expired" in response.json()["detail"].lower()
+
+
+def test_what_if_other_worker_consent_returns_403(client, db_session):
+    add_consent(db_session, worker_id="WRK-OTHER")
+    add_record(db_session)
+    add_months(db_session)
+    add_profile(db_session)
+    response = client.post("/api/v1/verify/what-if", json=what_if_payload())
+    assert response.status_code == 403
+    assert "different worker" in response.json()["detail"].lower()
+
+
+def test_what_if_other_phone_consent_returns_403(client, db_session):
+    add_consent(db_session, phone_number="+919800000002")
+    add_record(db_session)
+    add_months(db_session)
+    add_profile(db_session)
+    response = client.post("/api/v1/verify/what-if", json=what_if_payload())
+    assert response.status_code == 403
+    assert "does not match" in response.json()["detail"].lower()
+
+
+def test_what_if_never_persists_any_rows(client, db_session):
+    seed_full(db_session)
+
+    def row_counts():
+        return {
+            table.name: db_session.scalar(
+                select(func.count()).select_from(table)
+            )
+            for table in Base.metadata.sorted_tables
+        }
+
+    before = row_counts()
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(
+            hypothetical_upi_monthly_inflows=[30000.0] * 6,
+            hypothetical_unique_senders=[12] * 6,
+        ),
+    )
+    assert response.status_code == 200
+    assert "verification_id" not in response.json()
+    assert row_counts() == before
+
+
+def test_what_if_deltas_are_zero_when_scenario_matches_baseline(client, db_session):
+    seed_full(db_session)
+    response = client.post("/api/v1/verify/what-if", json=what_if_payload())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["hypothetical"] is True
+    assert body["baseline"]["recommendation_code"] == PROCEED_TO_UNDERWRITING
+    assert body["scenario"]["hypothetical_recommendation_code"] == PROCEED_TO_UNDERWRITING
+    assert "recommendation" not in body["scenario"]
+    assert body["deltas"] == {
+        "income_low": 0.0,
+        "surplus": 0.0,
+        "max_affordable_emi": 0.0,
+        "confidence_score": 0.0,
+    }
+
+
+def test_what_if_deltas_are_scenario_minus_baseline(client, db_session):
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(
+            hypothetical_upi_monthly_inflows=[40000.0] * 6,
+            hypothetical_unique_senders=[20] * 6,
+            stated_monthly_income=35000.0,
+            monthly_outgoings=OUTGOINGS,
+            proposed_emi=1000.0,
+            tenure_months=24,
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    baseline = body["baseline"]
+    scenario = body["scenario"]
+    assert body["deltas"]["income_low"] == (
+        scenario["income_low"] - baseline["income_low"]
+    )
+    assert body["deltas"]["surplus"] == (
+        scenario["surplus_conservative"] - baseline["surplus_conservative"]
+    )
+    assert body["deltas"]["max_affordable_emi"] == (
+        scenario["max_affordable_emi"] - baseline["max_affordable_emi"]
+    )
+    assert body["deltas"]["confidence_score"] == (
+        scenario["confidence_score"] - baseline["confidence_score"]
+    )
+
+
+def test_what_if_hypothetical_inflows_change_income_and_confidence(
+    client, db_session
+):
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(
+            hypothetical_upi_monthly_inflows=[10000.0],
+            hypothetical_unique_senders=[20],
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scenario"]["income_low"] < body["baseline"]["income_low"]
+    assert body["scenario"]["confidence_score"] < body["baseline"]["confidence_score"]
+    assert body["deltas"]["income_low"] < 0
+    assert body["deltas"]["confidence_score"] < 0
+
+
+def test_what_if_overstated_income_needs_more_evidence(client, db_session):
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(stated_monthly_income=90000.0),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["baseline"]["recommendation_code"] == PROCEED_TO_UNDERWRITING
+    assert (
+        body["scenario"]["hypothetical_recommendation_code"]
+        == NEEDS_MORE_EVIDENCE
+    )
+    assert any(
+        flag["code"] == "STATED_OVERSTATED" for flag in body["scenario"]["flags"]
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_features", {"late_share": 0.0}),
+        ("credit_term_months", 24),
+        ("late_share", 0.1),
+        ("unknown_field", True),
+    ],
+)
+def test_what_if_rejects_extra_and_model_feature_fields(
+    client, db_session, field, value
+):
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(**{field: value}),
+    )
+    assert response.status_code == 422
+
+
+def test_what_if_rejects_mismatched_hypothetical_sender_lengths(
+    client, db_session
+):
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(
+            hypothetical_upi_monthly_inflows=[10000.0, 12000.0],
+            hypothetical_unique_senders=[5],
+        ),
+    )
+    assert response.status_code == 422
+
+
+def test_what_if_response_has_no_forbidden_keys(client, db_session):
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(hypothetical_upi_monthly_inflows=[30000.0] * 6),
+    )
+    assert response.status_code == 200
+    assert_no_forbidden_keys(response.json())
+
+
+def test_verify_response_matches_recorded_snapshot(client, db_session):
+    seed_full(db_session)
+    body = client.post("/api/v1/verify", json=payload()).json()
+    expected = {
+        "income": {
+            "low": 26711.25,
+            "mid": 27115.0,
+            "high": 27688.75,
+            "conservative": 26711.25,
+            "stated": 32000.0,
+            "stated_vs_evidence_ratio": 1.18,
+        },
+        "surplus_conservative": 10211.25,
+        "confidence_score": 95,
+        "confidence_level": "HIGH",
+        "max_affordable_emi": 10211.25,
+        "recommendation_code": PROCEED_TO_UNDERWRITING,
+        "risk_band": "LOW",
+        "data_notice": None,
+    }
+    actual = {
+        "income": body["income"],
+        "surplus_conservative": body["surplus_conservative"],
+        "confidence_score": body["evidence"]["confidence_score"],
+        "confidence_level": body["evidence"]["confidence_level"],
+        "max_affordable_emi": body["affordability"]["max_affordable_emi"],
+        "recommendation_code": body["recommendation"]["code"],
+        "risk_band": body["risk_signal"]["band"],
+        "data_notice": body["data_notice"],
+    }
+    assert actual == expected
+
+
+def test_data_notice_appears_for_seeded_profiles_in_verify_and_what_if(
+    client, db_session
+):
+    add_consent(db_session)
+    add_record(db_session)
+    add_months(db_session)
+    profile = add_profile(db_session)
+    profile.source = "home_credit_heldout_row"
+    db_session.commit()
+
+    verify_body = client.post("/api/v1/verify", json=payload()).json()
+    what_if_body = client.post(
+        "/api/v1/verify/what-if", json=what_if_payload()
+    ).json()
+    expected = (
+        "Demonstration worker: risk features come from a held-out row of a public, "
+        "non-Indian dataset; UPI evidence is simulated."
+    )
+    assert verify_body["data_notice"] == expected
+    assert what_if_body["data_notice"] == expected
+
+
+def test_data_notice_is_null_for_ordinary_profiles(client, db_session):
+    seed_full(db_session)
+    body = client.post("/api/v1/verify", json=payload()).json()
+    assert body["data_notice"] is None
