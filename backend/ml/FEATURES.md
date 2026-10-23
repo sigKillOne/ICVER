@@ -73,3 +73,26 @@ In compliance with anti-discrimination and fair lending principles, protected de
 - **Partitioning Strategy**:
   - `backend/data/processed/features_train.parquet`: Ommits `EXT_SOURCE` features. This enforces models to evaluate creditworthiness purely on alternative data, internal repayment behavior, and borrower stability.
   - `backend/data/processed/features_train_with_ext.parquet`: Generated via `python -m backend.ml.features_home_credit --include-ext-sources`. Includes `ext_source_1`, `ext_source_2`, and `ext_source_3` as benchmark features to contrast alternative data performance against established credit bureau ratings.
+
+---
+
+## 5. v2 exclusions
+
+v1 of the repayment-risk model (`backend/ml/train_risk_model.py`, 30 features) includes several columns whose **units cannot be mapped onto Indian informal workers' monthly rupee figures**. The Home Credit Default Risk dataset does not document the currency of amount fields or whether income is monthly, annual, or something else. ICVER's production path estimates income in INR from UPI/SMS evidence with a separate rule-based engine, so the risk model must not depend on those incommensurable amounts.
+
+v2 (`backend/ml/train_risk_model_v2.py`) therefore **excludes these 6 features** and trains on the remaining **24**:
+
+| Excluded feature | Why it is dropped |
+| :--- | :--- |
+| `income_total` | Declared income amount; currency and income period are undocumented, so it cannot be mapped to monthly INR. |
+| `log_income` | Transform of `income_total`; same unit problem. |
+| `income_per_family_member` | `income_total / CNT_FAM_MEMBERS`; still an undocumented-currency income amount. |
+| `annuity_to_income` | Mixes loan annuity with undocumented income; not a portable affordability ratio for India. |
+| `credit_to_income` | Mixes credit amount with undocumented income; same mapping failure. |
+| `bureau_total_debt` | Sum of bureau `AMT_CREDIT_SUM_DEBT` in undocumented currency; cannot be mapped to INR outstanding debt. |
+
+**Kept on purpose:** `credit_term_months` (`AMT_CREDIT / AMT_ANNUITY`). Both sides of the ratio are amounts in the **same** (unknown) currency, so the unit cancels and the feature is a duration-like term, not a rupee figure.
+
+Income, debt-service, and affordability for Indian workers remain **rule-based** (FOIR, surplus, verified-income engine), not inputs to this classifier.
+
+v2 uses the same stratified 60/20/20 split, seed 42, XGBoost hyperparameters, early stopping, and isotonic calibration as v1 so the two models can be compared on the same test `SK_ID_CURR` set. Artifacts live in `backend/ml/artifacts/risk_v2/`.
