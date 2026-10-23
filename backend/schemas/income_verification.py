@@ -57,8 +57,8 @@ class ScoringRequest(BaseModel):
         default=[],
         description="List of worker mobile recharge logs"
     )
-    monthly_cashflow_avg: Optional[float] = Field(default=28500.0, ge=0)
-    gig_platform_earnings: Optional[float] = Field(default=15000.0, ge=0)
+    monthly_cashflow_avg: Optional[float] = Field(default=None, ge=0)
+    gig_platform_earnings: Optional[float] = Field(default=None, ge=0)
     # Simulator feature overrides
     upi_monthly_inflow: Optional[float] = Field(default=None)
     weekly_txn_frequency: Optional[int] = Field(default=None)
