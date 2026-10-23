@@ -36,6 +36,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+LEGACY_SCORE_PATH = f"{settings.API_V1_STR}/score"
+LEGACY_SCORE_DEPRECATION_HEADERS = {
+    "Deprecation": "true",
+    "X-ICVER-Notice": "legacy endpoint, use /api/v1/verify",
+}
+
+
+@app.middleware("http")
+async def deprecate_legacy_score(request: Request, call_next):
+    """Mark the legacy score API as deprecated and optionally disable it."""
+    is_legacy_score = request.url.path.startswith(LEGACY_SCORE_PATH)
+    if is_legacy_score and not settings.LEGACY_SCORE_ENABLED:
+        return JSONResponse(
+            status_code=410,
+            content={
+                "detail": (
+                    "The legacy /api/v1/score endpoint was removed. "
+                    "Use /api/v1/verify instead."
+                )
+            },
+            headers=LEGACY_SCORE_DEPRECATION_HEADERS,
+        )
+
+    response = await call_next(request)
+    if is_legacy_score:
+        response.headers.update(LEGACY_SCORE_DEPRECATION_HEADERS)
+    return response
+
 
 @app.exception_handler(RequestValidationError)
 async def redact_validation_inputs(
@@ -80,4 +108,5 @@ def health_check():
             "models_loaded": models_ready
         },
         "risk_v2": risk_status,
+        "legacy_score_enabled": bool(settings.LEGACY_SCORE_ENABLED),
     }

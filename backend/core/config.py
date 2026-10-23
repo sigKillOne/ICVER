@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     DEBUG: bool = False
 
+    # The legacy /score endpoint is deprecated and will be removed.
+    LEGACY_SCORE_ENABLED: bool = True
+
     # Feature override permission
     ALLOW_FEATURE_OVERRIDES: bool = False
 

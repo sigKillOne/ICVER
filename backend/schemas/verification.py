@@ -283,6 +283,7 @@ class EvidenceSummary(BaseModel):
     provenance: Dict[str, str]
     flags: List[Dict[str, str]]
     reasons: List[str]
+    consistency_note: Optional[str] = None
 
 
 class AffordabilitySummary(BaseModel):

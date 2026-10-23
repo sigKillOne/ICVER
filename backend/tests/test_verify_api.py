@@ -1305,3 +1305,145 @@ def test_data_notice_is_null_for_ordinary_profiles(client, db_session):
     seed_full(db_session)
     body = client.post("/api/v1/verify", json=payload()).json()
     assert body["data_notice"] is None
+
+
+
+# ---------------------------------------------------------------------------
+# Consistency checks integration
+# ---------------------------------------------------------------------------
+def test_verify_includes_consistency_flags_and_note(client, db_session):
+    from backend.core.consistency_checks import CONSISTENCY_NOTE, EVIDENCE_GAP
+
+    add_consent(db_session)
+    add_record(db_session)
+    months = recent_month_keys(6)
+    gap_months = [months[0], months[1], months[3], months[4], months[5]]
+    add_months(
+        db_session,
+        inflows=[30000.0] * 5,
+        months=gap_months,
+        senders=[12] * 5,
+    )
+    add_profile(db_session)
+
+    response = client.post("/api/v1/verify", json=payload())
+    assert response.status_code == 200
+    body = response.json()
+    flags = body["evidence"]["flags"]
+    gap_flags = [flag for flag in flags if flag["code"] == EVIDENCE_GAP]
+    assert len(gap_flags) == 1
+    assert gap_flags[0]["source"] == "consistency_checks"
+    assert all(
+        flag.get("source") in {"income_engine", "consistency_checks"}
+        for flag in flags
+    )
+    assert any(flag.get("source") == "income_engine" for flag in flags)
+    assert body["evidence"]["consistency_note"] == CONSISTENCY_NOTE
+
+
+def test_what_if_applies_consistency_checks_to_hypothetical_series(
+    client, db_session
+):
+    from backend.core.consistency_checks import LATEST_MONTH_SPIKE
+
+    seed_full(db_session)
+    response = client.post(
+        "/api/v1/verify/what-if",
+        json=what_if_payload(
+            hypothetical_upi_monthly_inflows=[
+                32000.0,
+                32000.0,
+                32000.0,
+                100000.0,
+            ],
+            hypothetical_unique_senders=[15, 15, 15, 15],
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    scenario_flags = body["scenario"]["flags"]
+    spike_flags = [
+        flag for flag in scenario_flags if flag["code"] == LATEST_MONTH_SPIKE
+    ]
+    assert len(spike_flags) == 1
+    assert spike_flags[0]["source"] == "consistency_checks"
+    assert LATEST_MONTH_SPIKE not in {
+        flag["code"] for flag in body["baseline"]["flags"]
+    }
+
+
+def test_constant_inflow_caveat_only_for_vendor_occupation(client, db_session):
+    from backend.core.consistency_checks import CONSTANT_INFLOW
+
+    add_consent(db_session)
+    add_record(db_session)
+    months = recent_month_keys(4)
+    add_months(
+        db_session,
+        inflows=[28000.0] * 4,
+        months=months,
+        senders=[12] * 4,
+    )
+    add_profile(db_session)
+
+    vendor = client.post(
+        "/api/v1/verify",
+        json=payload(
+            stated_monthly_income=None,
+            occupation_type="Street vendor",
+        ),
+    ).json()
+    driver = client.post(
+        "/api/v1/verify",
+        json=payload(
+            stated_monthly_income=None,
+            occupation_type="Driver",
+        ),
+    ).json()
+
+    assert vendor["recommendation"]["code"] == driver["recommendation"]["code"]
+    assert CONSTANT_INFLOW in {
+        flag["code"] for flag in vendor["evidence"]["flags"]
+    }
+    assert CONSTANT_INFLOW in {
+        flag["code"] for flag in driver["evidence"]["flags"]
+    }
+    assert any(
+        "Consistency check" in caveat and "same monthly inflow" in caveat
+        for caveat in vendor["recommendation"]["caveats"]
+    )
+    assert not any(
+        "same monthly inflow" in caveat
+        for caveat in driver["recommendation"]["caveats"]
+    )
+
+
+def test_new_responses_have_no_forbidden_keys_or_fraud_strings(
+    client, db_session
+):
+    seed_full(db_session)
+
+    def strings(value):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                yield str(key)
+                yield from strings(nested)
+        elif isinstance(value, list):
+            for item in value:
+                yield from strings(item)
+        elif isinstance(value, str):
+            yield value
+
+    responses = [
+        client.post("/api/v1/verify", json=payload()).json(),
+        client.post(
+            "/api/v1/verify/what-if",
+            json=what_if_payload(
+                hypothetical_upi_monthly_inflows=[32000.0] * 4,
+                hypothetical_unique_senders=[12] * 4,
+            ),
+        ).json(),
+    ]
+    for body in responses:
+        assert_no_forbidden_keys(body)
+        assert all("fraud" not in text.lower() for text in strings(body))

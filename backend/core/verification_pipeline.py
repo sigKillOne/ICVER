@@ -15,6 +15,10 @@ try:
     from backend.core import risk_v2
     from backend.core.config import settings
     from backend.core.consent import validate_consent
+    from backend.core.consistency_checks import (
+        CONSISTENCY_NOTE,
+        check_evidence_consistency,
+    )
     from backend.core.income_verification import EvidenceInput, VerificationResult, verify
     from backend.core.parser import extract_upi_inflow
     from backend.core.phone import normalize_phone
@@ -52,6 +56,7 @@ except ModuleNotFoundError:  # pragma: no cover - flat module execution fallback
     from core import risk_v2
     from core.config import settings
     from core.consent import validate_consent
+    from core.consistency_checks import CONSISTENCY_NOTE, check_evidence_consistency
     from core.income_verification import EvidenceInput, VerificationResult, verify
     from core.parser import extract_upi_inflow
     from core.phone import normalize_phone
@@ -186,7 +191,7 @@ WHAT_IF_STORED_UPI_NOTE = (
     "No hypothetical UPI series was supplied; the scenario uses stored UPI evidence."
 )
 
-UpiSeriesOverride = Tuple[List[str], List[float], List[int], bool]
+UpiSeriesOverride = Tuple[List[str], List[float], List[Optional[int]], bool]
 
 
 def compute_affordability(
@@ -259,7 +264,7 @@ def _build_sms_evidence(
     messages: Optional[List[Any]],
     now_utc: datetime,
     upi_by_month: Dict[str, float],
-) -> Tuple[List[float], List[float], SmsSummary, str, Optional[str]]:
+) -> Tuple[List[float], List[float], SmsSummary, str, Optional[str], List[str]]:
     """Aggregate SMS credits in IST and apply anti-inflation clipping.
 
     The SMS text and timestamps are client-supplied. Raw text is never retained; only
@@ -381,6 +386,7 @@ def _build_sms_evidence(
         summary,
         provenance,
         ignored_reason,
+        all_months,
     )
 
 
@@ -389,7 +395,7 @@ def _load_upi_evidence(
     worker_id: str,
     record: FinancialRecord,
     fallback_month_key: str,
-) -> Tuple[List[str], List[float], List[int], bool]:
+) -> Tuple[List[str], List[float], List[Optional[int]], bool]:
     rows = (
         db.query(WorkerMonthlyEvidence)
         .filter(WorkerMonthlyEvidence.worker_id == worker_id)
@@ -399,10 +405,11 @@ def _load_upi_evidence(
     if rows:
         month_keys = [row.year_month for row in rows]
         inflows = [float(row.upi_inflow or 0.0) for row in rows]
-        senders = [
-            int(row.upi_unique_senders)
+        senders: List[Optional[int]] = [
+            None
+            if row.upi_unique_senders is None
+            else int(row.upi_unique_senders)
             for row in rows
-            if row.upi_unique_senders is not None
         ]
         return month_keys, inflows, senders, False
 
@@ -410,7 +417,7 @@ def _load_upi_evidence(
     if aggregate is None:
         return [], [], [], False
 
-    senders = []
+    senders: List[Optional[int]] = [None]
     if record.unique_sender_count is not None:
         senders = [int(record.unique_sender_count)]
     return [fallback_month_key], [float(aggregate)], senders, True
@@ -579,9 +586,14 @@ def run_verification(
     else:
         upi_month_keys, upi_inflows, upi_senders, used_fallback = upi_override
     upi_by_month = dict(zip(upi_month_keys, upi_inflows))
-    sms_series, upi_series, sms_summary, sms_provenance, sms_ignored_reason = (
-        _build_sms_evidence(request.sms_log, now_utc, upi_by_month)
-    )
+    (
+        sms_series,
+        upi_series,
+        sms_summary,
+        sms_provenance,
+        sms_ignored_reason,
+        evidence_month_keys,
+    ) = _build_sms_evidence(request.sms_log, now_utc, upi_by_month)
 
     has_database_upi = any(value > 0 for value in upi_inflows)
     sms_only_evidence = sms_summary.used > 0 and not has_database_upi
@@ -612,6 +624,23 @@ def run_verification(
             }
         )
 
+    for flag in evidence_result.flags:
+        flag["source"] = "income_engine"
+
+    sender_by_month = dict(zip(upi_month_keys, upi_senders))
+    consistency_months = [
+        {
+            "year_month": month_key,
+            "inflow": float(upi_by_month.get(month_key, 0.0)),
+            "unique_senders": sender_by_month.get(month_key),
+        }
+        for month_key in evidence_month_keys
+    ]
+    consistency_flags = check_evidence_consistency(consistency_months)
+    for flag in consistency_flags:
+        flag["source"] = "consistency_checks"
+    evidence_result.flags.extend(consistency_flags)
+
     affordability = compute_affordability(
         evidence_result,
         request.monthly_outgoings,
@@ -626,7 +655,10 @@ def run_verification(
         db, request.worker_id, request
     )
     recommendation = recommend(
-        evidence_result, risk_for_recommendation, affordability_for_recommendation
+        evidence_result,
+        risk_for_recommendation,
+        affordability_for_recommendation,
+        occupation_type=request.occupation_type,
     )
     _apply_risk_display(risk_signal, str(recommendation["code"]))
 
@@ -660,6 +692,7 @@ def run_verification(
             provenance={"upi": upi_provenance, "sms": sms_provenance},
             flags=evidence_result.flags,
             reasons=evidence_result.reasons,
+            consistency_note=CONSISTENCY_NOTE,
         ),
         affordability=AffordabilitySummary(
             foir_current=affordability["foir_current"],
@@ -724,10 +757,15 @@ def run_what_if(db: Session, request: WhatIfRequest) -> WhatIfResponse:
     upi_override: Optional[UpiSeriesOverride] = None
     inflows = request.hypothetical_upi_monthly_inflows
     if inflows is not None:
+        senders: List[Optional[int]]
+        if request.hypothetical_unique_senders:
+            senders = list(request.hypothetical_unique_senders)
+        else:
+            senders = [None] * len(inflows)
         upi_override = (
             _hypothetical_month_keys(len(inflows), now_utc),
             list(inflows),
-            list(request.hypothetical_unique_senders or []),
+            senders,
             False,
         )
 

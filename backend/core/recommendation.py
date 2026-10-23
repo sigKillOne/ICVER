@@ -46,6 +46,32 @@ CAVEAT_UNVERIFIED_SMS = (
     "database evidence"
 )
 
+CONSISTENCY_CAVEAT_CODES = {
+    "EVIDENCE_GAP",
+    "LATEST_MONTH_SPIKE",
+    "SENDER_DROP",
+}
+CONSTANT_INFLOW_CODE = "CONSTANT_INFLOW"
+VENDOR_OCCUPATION_KEYWORD = "vendor"
+CONSISTENCY_CAVEAT_FALLBACKS = {
+    "EVIDENCE_GAP": (
+        "the monthly evidence has a gap; the lender may want to confirm the history "
+        "is complete"
+    ),
+    "LATEST_MONTH_SPIKE": (
+        "the latest month stands out from earlier months; the lender may want to "
+        "confirm the source of the deposit"
+    ),
+    "CONSTANT_INFLOW": (
+        "the same monthly inflow appears repeatedly; the lender may want to confirm "
+        "the income source"
+    ),
+    "SENDER_DROP": (
+        "the latest month has fewer unique senders than earlier months; the lender may "
+        "want to confirm the counterparties"
+    ),
+}
+
 
 def _has_flag(evidence_result: Any, code: str) -> bool:
     return any(flag.get("code") == code for flag in evidence_result.flags)
@@ -76,19 +102,44 @@ def _sms_caveat(affordability: Dict[str, Any]) -> List[str]:
     return []
 
 
+def _consistency_caveats(
+    evidence_result: Any, occupation_type: str | None
+) -> List[str]:
+    is_vendor = bool(
+        isinstance(occupation_type, str)
+        and VENDOR_OCCUPATION_KEYWORD in occupation_type.lower()
+    )
+    caveats: List[str] = []
+    for flag in evidence_result.flags:
+        code = flag.get("code")
+        if code == CONSTANT_INFLOW_CODE and not is_vendor:
+            continue
+        if code not in CONSISTENCY_CAVEAT_CODES and code != CONSTANT_INFLOW_CODE:
+            continue
+        message = str(
+            flag.get("message")
+            or CONSISTENCY_CAVEAT_FALLBACKS.get(str(code), "")
+        ).strip()
+        if message:
+            caveats.append(f"Consistency check: {message}")
+    return caveats
+
+
 def recommend(
     evidence_result: Any,
     risk: Dict[str, Any],
     affordability: Dict[str, Any],
+    occupation_type: str | None = None,
 ) -> Dict[str, List[str] | str]:
     """Apply the recommendation rules in priority order and add non-blocking caveats."""
     reasons: List[str] = []
+    consistency_caveats = _consistency_caveats(evidence_result, occupation_type)
 
     if _has_flag(evidence_result, NO_EVIDENCE_FLAG):
         return {
             "code": INSUFFICIENT_EVIDENCE,
             "reasons": ["No reliable UPI or bank SMS evidence was available to verify income."],
-            "caveats": [],
+            "caveats": consistency_caveats,
         }
 
     if evidence_result.evidence_confidence_level == LOW_CONFIDENCE:
@@ -98,7 +149,9 @@ def recommend(
                 f"Evidence confidence is LOW ({evidence_result.evidence_confidence_score}/100); "
                 "more transaction history or corroborating evidence is needed."
             ],
-            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
+            "caveats": (
+                _risk_caveats(risk) + _sms_caveat(affordability) + consistency_caveats
+            ),
         }
 
     if _has_flag(evidence_result, STATED_OVERSTATED_FLAG):
@@ -109,14 +162,16 @@ def recommend(
                 message
                 or "Stated income is materially above the verified evidence, so more evidence is needed."
             ],
-            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
+            "caveats": (
+                _risk_caveats(risk) + _sms_caveat(affordability) + consistency_caveats
+            ),
         }
 
     if _has_flag(evidence_result, UNVERIFIED_EVIDENCE_ONLY_FLAG):
         return {
             "code": NEEDS_MORE_EVIDENCE,
             "reasons": [UNVERIFIED_SMS_ONLY_REASON],
-            "caveats": _risk_caveats(risk),
+            "caveats": _risk_caveats(risk) + consistency_caveats,
         }
 
     proposed_emi = affordability.get("proposed_emi")
@@ -133,7 +188,9 @@ def recommend(
                 f"affordable EMI of \u20b9{float(max_affordable_emi):,.2f} under the "
                 "conservative affordability test."
             ],
-            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
+            "caveats": (
+                _risk_caveats(risk) + _sms_caveat(affordability) + consistency_caveats
+            ),
         }
 
     if risk.get("band") == HIGH_RISK_BAND:
@@ -142,7 +199,9 @@ def recommend(
             "reasons": [
                 "The reference-population repayment-risk band is HIGH; manual review is recommended."
             ],
-            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
+            "caveats": (
+                _risk_caveats(risk) + _sms_caveat(affordability) + consistency_caveats
+            ),
         }
 
     reasons.append(
@@ -163,6 +222,7 @@ def recommend(
         caveats.append(CAVEAT_LIMITED_RELIABILITY)
     if affordability.get("sms_provenance") == CLIENT_SUPPLIED_SMS_PROVENANCE:
         caveats.append(CAVEAT_UNVERIFIED_SMS)
+    caveats.extend(consistency_caveats)
 
     return {
         "code": PROCEED_TO_UNDERWRITING,
