@@ -2,11 +2,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
+    from backend.core import risk_v2
     from backend.core.config import settings
     from backend.api.router import router as api_router, is_ml_ready
+    from backend.api.verify_router import router as verify_router
 except ModuleNotFoundError:
+    from core import risk_v2
     from core.config import settings
     from api.router import router as api_router, is_ml_ready
+    from api.verify_router import router as verify_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -32,6 +36,7 @@ app.add_middleware(
 
 # Include main API router with version prefix
 app.include_router(api_router, prefix=settings.API_V1_STR, tags=["Income Verification & Consent"])
+app.include_router(verify_router, prefix=settings.API_V1_STR, tags=["Verification & Risk"])
 
 
 @app.get("/", tags=["Root"])
@@ -47,10 +52,12 @@ def root():
 @app.get("/health", tags=["Health"])
 def health_check():
     models_ready = is_ml_ready()
+    risk_status = risk_v2.health()
     return {
         "status": "healthy" if models_ready else "degraded",
         "service": "icver-backend",
         "model_status": {
             "models_loaded": models_ready
-        }
+        },
+        "risk_v2": risk_status,
     }

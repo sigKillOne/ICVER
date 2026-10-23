@@ -1,6 +1,16 @@
 from typing import Generator
 from datetime import datetime, timezone
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+    Boolean,
+    JSON,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 try:
@@ -73,6 +83,52 @@ class ScoreHistory(Base):
     credit_score = Column(Integer)
     risk_tier = Column(String(50))
     calculated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class WorkerMonthlyEvidence(Base):
+    """Database-backed monthly UPI evidence for the /verify flow."""
+
+    __tablename__ = "worker_monthly_evidence"
+    __table_args__ = (
+        UniqueConstraint("worker_id", "year_month", name="uq_worker_monthly_evidence"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    worker_id = Column(String(50), index=True, nullable=False)
+    year_month = Column(String(7), nullable=False)
+    upi_inflow = Column(Float, nullable=False, default=0.0)
+    upi_unique_senders = Column(Integer, nullable=True)
+
+
+class WorkerRiskProfile(Base):
+    """A worker's reference-population risk-model features."""
+
+    __tablename__ = "worker_risk_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    worker_id = Column(String(50), unique=True, index=True, nullable=False)
+    features = Column(JSON, nullable=False, default=dict)
+    source = Column(String(100), nullable=False, default="self_reported")
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+class VerificationResultRecord(Base):
+    """Persisted response from the /verify decision-support flow."""
+
+    __tablename__ = "verification_results"
+
+    id = Column(String(50), primary_key=True, index=True)
+    worker_id = Column(String(50), index=True, nullable=False)
+    consent_id = Column(String(50), index=True, nullable=False)
+    result = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
 
 
 def get_db() -> Generator[Session, None, None]:

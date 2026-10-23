@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     # Feature override permission
     ALLOW_FEATURE_OVERRIDES: bool = False
 
+    # Affordability policy parameter for the new /verify flow.
+    # Assumption (not a regulatory assertion): cap total EMI obligations at 50% of
+    # conservative verified income. Lenders must review this against current guidance.
+    FOIR_CAP: float = 0.5
+
     # Database Configuration (MariaDB / MySQL via PyMySQL)
     DATABASE_URL: str = "mysql+pymysql://icver_user:icver_password@localhost:3306/icver_db"
 
