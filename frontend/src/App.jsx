@@ -2,10 +2,9 @@ import React, { useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import Header from './components/Header';
 import ConsentScreen from './components/ConsentScreen';
-import ScoreDashboard from './components/ScoreDashboard';
+import VerificationDashboard from './components/VerificationDashboard';
 import Sidebar from './components/Sidebar';
 import TransactionHistory from './components/TransactionHistory';
-import LoanOffers from './components/LoanOffers';
 import Settings from './components/Settings';
 import BankDashboard from './components/bank/BankDashboard';
 import { PersonaProvider } from './context/PersonaContext';
@@ -34,7 +33,7 @@ export default function App() {
               <Sidebar />
 
               <main className="main-content">
-                <Header consentGranted={!!consentRecord} />
+                <Header />
 
                 <Routes>
                   {/* Redirect root to worker dashboard */}
@@ -42,9 +41,8 @@ export default function App() {
                   <Route path="/dashboard" element={<Navigate to="/worker/dashboard" replace />} />
 
                   {/* Worker Routes */}
-                  <Route path="/worker/dashboard" element={<ScoreDashboard consentRecord={consentRecord} />} />
+                  <Route path="/worker/dashboard" element={<VerificationDashboard />} />
                   <Route path="/worker/transactions" element={<TransactionHistory consentRecord={consentRecord} />} />
-                  <Route path="/worker/loans" element={<LoanOffers consentRecord={consentRecord} />} />
                   <Route path="/worker/settings" element={<Settings />} />
 
                   {/* Bank Routes */}

@@ -4,6 +4,7 @@ import {
   ShieldAlert, CheckCircle, Search, X, ShieldCheck, AlertCircle,
   Scale, Landmark, BarChart3
 } from 'lucide-react';
+import SampleDataBanner from '../SampleDataBanner';
 
 const riskData = [
   { name: 'Eligible', value: 450, color: '#0f766e' },
@@ -164,6 +165,8 @@ export default function BankDashboard() {
 
   return (
     <div style={{ position: 'relative' }}>
+      <SampleDataBanner />
+
       {/* Page Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '24px' }}>
         <div>

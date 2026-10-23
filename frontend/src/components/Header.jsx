@@ -1,11 +1,29 @@
 import React from 'react';
 import { Activity, Bell, User, Building, Users } from 'lucide-react';
 import { usePersona } from '../context/PersonaContext';
+import { useVerification } from '../context/VerificationContext';
 import { useNavigate } from 'react-router-dom';
 
-export default function Header({ consentGranted }) {
+export default function Header() {
   const { persona, togglePersona } = usePersona();
+  const { status } = useVerification();
   const navigate = useNavigate();
+  const statusText = persona === 'bank'
+    ? 'Institution view'
+    : status === 'ready'
+      ? 'Verification ready'
+      : status === 'loading'
+        ? 'Verification in progress'
+        : status === 'error'
+          ? 'Verification needs attention'
+          : 'Awaiting verification';
+  const statusColor = persona === 'bank'
+    ? 'var(--violet)'
+    : status === 'ready'
+      ? 'var(--accent)'
+      : status === 'error'
+        ? 'var(--danger)'
+        : 'var(--text-tertiary)';
 
   const handleToggle = () => {
     togglePersona();
@@ -48,9 +66,9 @@ export default function Header({ consentGranted }) {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
         {/* Status */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: 'var(--accent)', fontWeight: 500 }}>
-          <Activity size={12} className="animate-pulse" />
-          Active
+        <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: statusColor, fontWeight: 500 }}>
+          <Activity size={12} className={status === 'loading' ? 'animate-pulse' : undefined} />
+          {statusText}
         </div>
 
         {/* Bell */}
@@ -65,7 +83,7 @@ export default function Header({ consentGranted }) {
               {persona === 'worker' ? 'Vineet' : 'Lending Officer'}
             </div>
             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-              {persona === 'worker' ? 'Pro Member' : 'Admin'}
+              {persona === 'worker' ? 'Worker account' : 'Admin'}
             </div>
           </div>
           <div style={{ width: '32px', height: '32px', background: 'var(--bg-page)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>

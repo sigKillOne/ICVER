@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { Search, Filter, IndianRupee, ArrowDownLeft, ArrowUpRight, CheckCircle2 } from 'lucide-react';
 import { usePersona } from '../context/PersonaContext';
+import SampleDataBanner from './SampleDataBanner';
 
 const generateMockData = (phone) => {
   if (phone === '5556667777') {
@@ -84,6 +85,8 @@ export default function TransactionHistory({ consentRecord }) {
 
   return (
     <div>
+      <SampleDataBanner />
+
       <h2 style={{ fontSize: '1.5rem', fontWeight: 600, marginBottom: '24px' }}>Transaction History</h2>
       
       {/* Summary Metric Cards */}

@@ -1,10 +1,20 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, History, Banknote, Settings, ShieldCheck, Users, Briefcase, FileSearch } from 'lucide-react';
+import { LayoutDashboard, History, Settings, ShieldCheck, Users, Briefcase, FileSearch } from 'lucide-react';
 import { usePersona } from '../context/PersonaContext';
+import { useVerification } from '../context/VerificationContext';
 
 export default function Sidebar() {
   const { persona } = usePersona();
+  const { verification, status } = useVerification();
+  const confidenceLevel = verification?.evidence?.confidence_level;
+  const verificationStatus = status === 'ready' && confidenceLevel
+    ? `Evidence confidence: ${confidenceLevel}`
+    : status === 'loading'
+      ? 'Verification in progress'
+      : status === 'error'
+        ? 'Verification needs attention'
+        : 'Start verification from the dashboard.';
 
   return (
     <aside className="sidebar">
@@ -34,15 +44,11 @@ export default function Sidebar() {
           <>
             <NavLink to="/worker/dashboard" className={({ isActive }) => isActive ? 'sidebar-link active' : 'sidebar-link'}>
               <LayoutDashboard size={16} />
-              Dashboard
+              Income Verification
             </NavLink>
             <NavLink to="/worker/transactions" className={({ isActive }) => isActive ? 'sidebar-link active' : 'sidebar-link'}>
               <History size={16} />
               Transactions
-            </NavLink>
-            <NavLink to="/worker/loans" className={({ isActive }) => isActive ? 'sidebar-link active' : 'sidebar-link'}>
-              <Banknote size={16} />
-              Loan Offers
             </NavLink>
             <NavLink to="/worker/settings" className={({ isActive }) => isActive ? 'sidebar-link active' : 'sidebar-link'}>
               <Settings size={16} />
@@ -70,8 +76,8 @@ export default function Sidebar() {
       {persona === 'worker' && (
         <div style={{ padding: '16px 12px', marginTop: 'auto' }}>
           <div style={{ padding: '12px', background: 'var(--accent-subtle)', border: '1px solid #ccfbf1' }}>
-            <p style={{ fontSize: '12px', color: 'var(--text-primary)', marginBottom: '4px', fontWeight: 600 }}>Profile 85% complete</p>
-            <p style={{ fontSize: '11px', color: 'var(--text-secondary)', margin: 0 }}>Verify Aadhaar to unlock higher limits.</p>
+            <p style={{ fontSize: '12px', color: 'var(--text-primary)', marginBottom: '4px', fontWeight: 600 }}>Income verification</p>
+            <p style={{ fontSize: '11px', color: 'var(--text-secondary)', margin: 0 }}>{verificationStatus}</p>
           </div>
         </div>
       )}
