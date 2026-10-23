@@ -1,5 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 try:
     from backend.core import risk_v2
@@ -33,6 +35,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def redact_validation_inputs(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Return validation details without echoing request values such as SMS text."""
+    safe_errors = []
+    for error in exc.errors():
+        safe_errors.append(
+            {
+                key: value
+                for key, value in error.items()
+                if key not in {"input", "ctx"}
+            }
+        )
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
+
 
 # Include main API router with version prefix
 app.include_router(api_router, prefix=settings.API_V1_STR, tags=["Income Verification & Consent"])

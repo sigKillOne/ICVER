@@ -243,6 +243,7 @@ def main() -> None:
                     result.evidence.confidence_level,
                     result.risk_signal.band or "n/a",
                     result.risk_signal.reliability or "n/a",
+                    result.risk_signal.display_priority,
                     f"{max_emi:,.2f}" if max_emi is not None else "n/a",
                 )
             )
@@ -255,19 +256,17 @@ def main() -> None:
         "confidence",
         "risk band",
         "reliability",
+        "risk display",
         "max affordable EMI",
     )
-    widths = [max(len(str(row[i])) for row in [headers, *rows]) for i in range(5)]
-    print(
-        f"{headers[0]:<{widths[0]}}  {headers[1]:<32}  {headers[2]:<10}  "
-        f"{headers[3]:<9}  {headers[4]:<11}  {headers[5]}"
-    )
-    print("-" * (sum(widths) + 75))
+    widths = [
+        max(len(str(row[i])) for row in [headers, *rows])
+        for i in range(len(headers))
+    ]
+    print("  ".join(f"{header:<{widths[i]}}" for i, header in enumerate(headers)))
+    print("-" * (sum(widths) + 2 * (len(headers) - 1)))
     for row in rows:
-        print(
-            f"{row[0]:<{widths[0]}}  {row[1]:<32}  {row[2]:<10}  "
-            f"{row[3]:<9}  {row[4]:<11}  {row[5]}"
-        )
+        print("  ".join(f"{str(value):<{widths[i]}}" for i, value in enumerate(row)))
     print("\nAll workers, amounts and profiles above are made-up demonstration data.")
 
 

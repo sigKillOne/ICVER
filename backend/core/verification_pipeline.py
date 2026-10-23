@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import calendar
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -14,8 +16,14 @@ try:
     from backend.core.config import settings
     from backend.core.consent import validate_consent
     from backend.core.income_verification import EvidenceInput, VerificationResult, verify
+    from backend.core.parser import extract_upi_inflow
     from backend.core.phone import normalize_phone
-    from backend.core.recommendation import recommend
+    from backend.core.recommendation import (
+        INSUFFICIENT_EVIDENCE,
+        LIMITED_RELIABILITY,
+        UNVERIFIED_EVIDENCE_ONLY_FLAG,
+        recommend,
+    )
     from backend.models.database import (
         FinancialRecord,
         VerificationResultRecord,
@@ -30,6 +38,8 @@ try:
         RecommendationSummary,
         RiskFactor,
         RiskSignalSummary,
+        SmsClippedMonth,
+        SmsSummary,
         VerifyRequest,
         VerifyResponse,
     )
@@ -38,8 +48,14 @@ except ModuleNotFoundError:  # pragma: no cover - flat module execution fallback
     from core.config import settings
     from core.consent import validate_consent
     from core.income_verification import EvidenceInput, VerificationResult, verify
+    from core.parser import extract_upi_inflow
     from core.phone import normalize_phone
-    from core.recommendation import recommend
+    from core.recommendation import (
+        INSUFFICIENT_EVIDENCE,
+        LIMITED_RELIABILITY,
+        UNVERIFIED_EVIDENCE_ONLY_FLAG,
+        recommend,
+    )
     from models.database import (
         FinancialRecord,
         VerificationResultRecord,
@@ -54,6 +70,8 @@ except ModuleNotFoundError:  # pragma: no cover - flat module execution fallback
         RecommendationSummary,
         RiskFactor,
         RiskSignalSummary,
+        SmsClippedMonth,
+        SmsSummary,
         VerifyRequest,
         VerifyResponse,
     )
@@ -69,14 +87,69 @@ RISK_UNAVAILABLE_REASON = (
     "No repayment-risk profile is available for this worker, so the reference-population "
     "risk signal cannot be computed."
 )
-SMS_IGNORED_NO_DATES = (
-    "SMS log ignored: the parser can extract per-message amounts but not transaction "
-    "dates, so credits cannot be grouped by calendar month without inventing data."
-)
-SMS_PROVENANCE_IGNORED = "ignored_no_dates"
+# Asia/Kolkata is the source timezone for Indian bank and UPI SMS receipts.
+INDIA_TIMEZONE = ZoneInfo("Asia/Kolkata")
+SMS_LOOKBACK_MONTHS = 12  # Assumption: one year of SMS history is the useful review window.
+SMS_MONTH_KEY_FORMAT = "%Y-%m"
+SMS_CONFIDENCE_CEILING = "MEDIUM"  # Assumption: unverified SMS alone cannot support HIGH confidence.
 SMS_PROVENANCE_NOT_PROVIDED = "not_provided"
 SMS_PROVENANCE_CLIENT = "client_supplied_unverified"
+SMS_PROVENANCE_NONE_USABLE = "ignored_none_usable"
 UPI_PROVENANCE_DATABASE = "database"
+UPI_PROVENANCE_NONE = "none"
+SMS_DROP_FUTURE = "future_received_at"
+SMS_DROP_TOO_OLD = "older_than_12_months"
+SMS_DROP_DUPLICATE = "duplicate"
+SMS_DROP_UNPARSEABLE = "unparseable"
+SMS_DROP_DEBIT = "debit"
+SMS_DROP_REASONS: Tuple[str, ...] = (
+    SMS_DROP_FUTURE,
+    SMS_DROP_TOO_OLD,
+    SMS_DROP_DUPLICATE,
+    SMS_DROP_UNPARSEABLE,
+    SMS_DROP_DEBIT,
+)
+# Assumption: the parser exposes credit extraction only, so these words identify a debit
+# message that yielded no parseable credit amount. This is only used for summary counts.
+SMS_DEBIT_KEYWORDS: Tuple[str, ...] = (
+    "debited",
+    "debit",
+    "withdrawn",
+    "withdrawal",
+    "spent",
+    "purchase",
+    "paid to",
+    "sent to",
+)
+SMS_IGNORED_NOTHING_USABLE = (
+    "SMS messages were provided, but none could be used: every message was dated "
+    "outside the allowed 12-month window, was an exact duplicate, was a debit, or had "
+    "no parseable credit amount."
+)
+SMS_CONFIDENCE_CAP_REASON = (
+    "Confidence capped at MEDIUM because income evidence rests only on client-supplied, "
+    "unverified SMS."
+)
+UNVERIFIED_SMS_FLAG = "UNVERIFIED_SMS"
+UNVERIFIED_SMS_MESSAGE = (
+    "SMS evidence is client-supplied and unverified; it is used only to cross-check "
+    "database UPI evidence."
+)
+UNVERIFIED_EVIDENCE_ONLY_MESSAGE = (
+    "All income evidence comes from client-supplied, unverified SMS; no database UPI "
+    "evidence is available."
+)
+DISPLAY_PRIORITY_PRIMARY = "primary"
+DISPLAY_PRIORITY_SECONDARY = "secondary"
+DISPLAY_NOTE_INSUFFICIENT = (
+    "Secondary because income evidence is insufficient to support a risk-based view."
+)
+DISPLAY_NOTE_UNAVAILABLE = (
+    "Secondary because no credit-history profile is available for this worker."
+)
+DISPLAY_NOTE_LIMITED = (
+    "Secondary because the credit-history profile has LIMITED reliability."
+)
 FALLBACK_EVIDENCE_REASON = (
     "No monthly UPI evidence rows were found; a single labelled fallback month was "
     "derived from the worker's database aggregate, which triggers the engine's "
@@ -142,9 +215,155 @@ def compute_affordability(
     }
 
 
+def _subtract_months(moment: datetime, months: int) -> datetime:
+    """Return the same clock time a whole number of calendar months earlier."""
+    month_index = moment.year * 12 + (moment.month - 1) - months
+    year, month_zero_based = divmod(month_index, 12)
+    month = month_zero_based + 1
+    day = min(moment.day, calendar.monthrange(year, month)[1])
+    return moment.replace(year=year, month=month, day=day)
+
+
+def _looks_like_debit(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in SMS_DEBIT_KEYWORDS)
+
+
+def _build_sms_evidence(
+    messages: Optional[List[Any]],
+    now_utc: datetime,
+    upi_by_month: Dict[str, float],
+) -> Tuple[List[float], List[float], SmsSummary, str, Optional[str]]:
+    """Aggregate SMS credits in IST and apply anti-inflation clipping.
+
+    The SMS text and timestamps are client-supplied. Raw text is never retained; only
+    month-level aggregates and counts leave this function.
+    """
+    messages = messages or []
+    earliest_allowed = _subtract_months(now_utc, SMS_LOOKBACK_MONTHS)
+    dropped_by_reason = {reason: 0 for reason in SMS_DROP_REASONS}
+    seen: set[tuple[str, datetime]] = set()
+    month_totals: Dict[str, float] = {}
+    used = 0
+
+    for message in messages:
+        received_at = message.received_at
+        if received_at > now_utc:
+            dropped_by_reason[SMS_DROP_FUTURE] += 1
+            continue
+        if received_at < earliest_allowed:
+            dropped_by_reason[SMS_DROP_TOO_OLD] += 1
+            continue
+
+        dedupe_key = (message.text, received_at)
+        if dedupe_key in seen:
+            dropped_by_reason[SMS_DROP_DUPLICATE] += 1
+            continue
+        seen.add(dedupe_key)
+
+        try:
+            amount = float(extract_upi_inflow(message.text))
+        except Exception:  # noqa: BLE001 - malformed SMS must never break verification
+            amount = 0.0
+
+        if amount <= 0:
+            reason = (
+                SMS_DROP_DEBIT
+                if _looks_like_debit(message.text)
+                else SMS_DROP_UNPARSEABLE
+            )
+            dropped_by_reason[reason] += 1
+            continue
+
+        month_key = received_at.astimezone(INDIA_TIMEZONE).strftime(
+            SMS_MONTH_KEY_FORMAT
+        )
+        month_totals[month_key] = month_totals.get(month_key, 0.0) + amount
+        used += 1
+
+    positive_upi_months = {
+        month_key for month_key, value in upi_by_month.items() if value > 0
+    }
+    sms_months = set(month_totals)
+    sms_covers_upi_months = bool(sms_months) and sms_months == positive_upi_months
+    # The engine compares parallel monthly lists and cannot represent sparse missing
+    # months. When both sources exist but the SMS log is sparse, fold the union into a
+    # single conservative series for the engine; this keeps months with only SMS
+    # unclipped without inventing false source disagreements.
+    all_months = (
+        sorted(set(upi_by_month) | sms_months)
+        if positive_upi_months
+        else (sorted(sms_months) if sms_months else sorted(upi_by_month))
+    )
+    upi_series: List[float] = []
+    sms_series: List[float] = []
+    clipped_months: List[SmsClippedMonth] = []
+
+    for month_key in all_months:
+        raw_sms_total = float(month_totals.get(month_key, 0.0))
+        upi_total = float(upi_by_month.get(month_key, 0.0) or 0.0)
+        used_sms_total = raw_sms_total
+        if month_key in upi_by_month and raw_sms_total > upi_total:
+            used_sms_total = max(upi_total, 0.0)
+            clipped_months.append(
+                SmsClippedMonth(
+                    month=month_key,
+                    sms_total=round(raw_sms_total, MONEY_DECIMALS),
+                    upi_total=round(upi_total, MONEY_DECIMALS),
+                    used_total=round(used_sms_total, MONEY_DECIMALS),
+                )
+            )
+        upi_series.append(upi_total)
+        sms_series.append(used_sms_total)
+
+    monthly_credits = {
+        month_key: round(value, MONEY_DECIMALS)
+        for month_key, value in zip(all_months, sms_series)
+    }
+    dropped = sum(dropped_by_reason.values())
+    summary = SmsSummary(
+        received=len(messages),
+        used=used,
+        dropped=dropped,
+        dropped_by_reason=dropped_by_reason,
+        clipped_months=clipped_months,
+        monthly_credits=monthly_credits,
+    )
+
+    if not messages:
+        provenance = SMS_PROVENANCE_NOT_PROVIDED
+    elif used == 0:
+        provenance = SMS_PROVENANCE_NONE_USABLE
+    else:
+        provenance = SMS_PROVENANCE_CLIENT
+
+    ignored_reason = (
+        SMS_IGNORED_NOTHING_USABLE if messages and used == 0 else None
+    )
+    if not positive_upi_months or sms_covers_upi_months:
+        engine_upi_series = upi_series
+        engine_sms_series = sms_series
+    else:
+        engine_upi_series = [
+            max(upi_value, sms_value)
+            for upi_value, sms_value in zip(upi_series, sms_series)
+        ]
+        engine_sms_series = [0.0] * len(sms_series)
+    return (
+        engine_sms_series,
+        engine_upi_series,
+        summary,
+        provenance,
+        ignored_reason,
+    )
+
+
 def _load_upi_evidence(
-    db: Session, worker_id: str, record: FinancialRecord
-) -> tuple[list[float], list[int], bool]:
+    db: Session,
+    worker_id: str,
+    record: FinancialRecord,
+    fallback_month_key: str,
+) -> Tuple[List[str], List[float], List[int], bool]:
     rows = (
         db.query(WorkerMonthlyEvidence)
         .filter(WorkerMonthlyEvidence.worker_id == worker_id)
@@ -152,22 +371,61 @@ def _load_upi_evidence(
         .all()
     )
     if rows:
+        month_keys = [row.year_month for row in rows]
         inflows = [float(row.upi_inflow or 0.0) for row in rows]
         senders = [
             int(row.upi_unique_senders)
             for row in rows
             if row.upi_unique_senders is not None
         ]
-        return inflows, senders, False
+        return month_keys, inflows, senders, False
 
     aggregate = record.upi_monthly_inflow
     if aggregate is None:
-        return [], [], False
+        return [], [], [], False
 
     senders = []
     if record.unique_sender_count is not None:
         senders = [int(record.unique_sender_count)]
-    return [float(aggregate)], senders, True
+    return [fallback_month_key], [float(aggregate)], senders, True
+
+
+def _apply_unverified_sms_only(evidence_result: VerificationResult) -> None:
+    """Add the verified-only flag and cap confidence at MEDIUM."""
+    if not any(
+        flag.get("code") == UNVERIFIED_EVIDENCE_ONLY_FLAG
+        for flag in evidence_result.flags
+    ):
+        evidence_result.flags.append(
+            {
+                "code": UNVERIFIED_EVIDENCE_ONLY_FLAG,
+                "severity": "HIGH",
+                "message": UNVERIFIED_EVIDENCE_ONLY_MESSAGE,
+            }
+        )
+
+    if evidence_result.evidence_confidence_level == "HIGH":
+        evidence_result.evidence_confidence_level = SMS_CONFIDENCE_CEILING
+        evidence_result.confidence_capped = True
+        evidence_result.reasons.insert(0, SMS_CONFIDENCE_CAP_REASON)
+
+
+def _apply_risk_display(risk_signal: Dict[str, Any], recommendation_code: str) -> None:
+    """Explain when the risk signal is secondary rather than the primary driver."""
+    note: Optional[str] = None
+    if recommendation_code == INSUFFICIENT_EVIDENCE:
+        note = DISPLAY_NOTE_INSUFFICIENT
+    elif not risk_signal.get("available", False):
+        note = DISPLAY_NOTE_UNAVAILABLE
+    elif risk_signal.get("reliability") == LIMITED_RELIABILITY:
+        note = DISPLAY_NOTE_LIMITED
+
+    if note:
+        risk_signal["display_priority"] = DISPLAY_PRIORITY_SECONDARY
+        risk_signal["display_note"] = note
+    else:
+        risk_signal["display_priority"] = DISPLAY_PRIORITY_PRIMARY
+        risk_signal["display_note"] = None
 
 
 def _fetch_worker(db: Session, phone_number: str) -> FinancialRecord:
@@ -264,23 +522,29 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
     )
     record = _fetch_worker(db, phone_number)
 
-    upi_inflows, upi_senders, used_fallback = _load_upi_evidence(
-        db, request.worker_id, record
+    now_utc = datetime.now(timezone.utc)
+    fallback_month_key = now_utc.astimezone(INDIA_TIMEZONE).strftime(
+        SMS_MONTH_KEY_FORMAT
+    )
+    upi_month_keys, upi_inflows, upi_senders, used_fallback = _load_upi_evidence(
+        db, request.worker_id, record, fallback_month_key
+    )
+    upi_by_month = dict(zip(upi_month_keys, upi_inflows))
+    sms_series, upi_series, sms_summary, sms_provenance, sms_ignored_reason = (
+        _build_sms_evidence(request.sms_log, now_utc, upi_by_month)
     )
 
-    if request.sms_log:
-        sms_provenance = SMS_PROVENANCE_IGNORED
-        sms_ignored_reason: Optional[str] = SMS_IGNORED_NO_DATES
-    else:
-        sms_provenance = SMS_PROVENANCE_NOT_PROVIDED
-        sms_ignored_reason = None
+    has_database_upi = any(value > 0 for value in upi_inflows)
+    sms_only_evidence = sms_summary.used > 0 and not has_database_upi
+    upi_provenance = (
+        UPI_PROVENANCE_DATABASE if has_database_upi else UPI_PROVENANCE_NONE
+    )
 
     evidence_input = EvidenceInput(
         stated_monthly_income=request.stated_monthly_income,
-        upi_monthly_inflows=upi_inflows,
+        upi_monthly_inflows=upi_series,
         upi_unique_senders_per_month=upi_senders,
-        # SMS is deliberately omitted because the parser exposes no transaction dates.
-        sms_monthly_credits=[],
+        sms_monthly_credits=sms_series,
         monthly_outgoings=request.monthly_outgoings or {},
         household_size=request.household_size,
         occupation_type=request.occupation_type,
@@ -288,6 +552,16 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
     evidence_result = verify(evidence_input)
     if used_fallback:
         evidence_result.reasons.insert(0, FALLBACK_EVIDENCE_REASON)
+    if sms_only_evidence:
+        _apply_unverified_sms_only(evidence_result)
+    elif has_database_upi and sms_summary.used > 0:
+        evidence_result.flags.append(
+            {
+                "code": UNVERIFIED_SMS_FLAG,
+                "severity": "MEDIUM",
+                "message": UNVERIFIED_SMS_MESSAGE,
+            }
+        )
 
     affordability = compute_affordability(
         evidence_result,
@@ -297,6 +571,7 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
     )
     affordability_for_recommendation = dict(affordability)
     affordability_for_recommendation["sms_provenance"] = sms_provenance
+    affordability_for_recommendation["upi_provenance"] = upi_provenance
 
     risk_signal, risk_for_recommendation = _build_risk_signal(
         db, request.worker_id, request
@@ -304,8 +579,9 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
     recommendation = recommend(
         evidence_result, risk_for_recommendation, affordability_for_recommendation
     )
+    _apply_risk_display(risk_signal, str(recommendation["code"]))
 
-    created_at = datetime.now(timezone.utc)
+    created_at = now_utc
     verification_id = f"VRF-{uuid.uuid4().hex[:VERIFICATION_ID_BYTES].upper()}"
 
     response = VerifyResponse(
@@ -332,7 +608,7 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
             confidence_capped=evidence_result.confidence_capped,
             components=evidence_result.confidence_components,
             months=evidence_result.months_of_evidence,
-            provenance={"upi": UPI_PROVENANCE_DATABASE, "sms": sms_provenance},
+            provenance={"upi": upi_provenance, "sms": sms_provenance},
             flags=evidence_result.flags,
             reasons=evidence_result.reasons,
         ),
@@ -344,6 +620,7 @@ def run_verification(db: Session, request: VerifyRequest) -> VerifyResponse:
         ),
         risk_signal=RiskSignalSummary(**risk_signal),
         recommendation=RecommendationSummary(**recommendation),
+        sms_summary=sms_summary,
         model_version=risk_v2.model_version() or "unknown",
         engine_version=ENGINE_VERSION,
         sms_ignored_reason=sms_ignored_reason,

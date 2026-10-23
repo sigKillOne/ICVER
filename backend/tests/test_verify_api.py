@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.core import risk_v2
+from backend.core.verification_pipeline import _subtract_months
 from backend.core.recommendation import (
     INSUFFICIENT_EVIDENCE,
     MANUAL_REVIEW_HIGH_RISK,
@@ -25,6 +27,7 @@ from backend.main import app
 from backend.models.database import (
     Base,
     FinancialRecord,
+    VerificationResultRecord,
     WorkerConsent,
     WorkerMonthlyEvidence,
     WorkerRiskProfile,
@@ -134,16 +137,25 @@ def add_record(
     return record
 
 
-def add_months(db, worker_id=WORKER, inflows=None):
-    for year_month, inflow, senders in zip(
-        MONTHS, inflows or INFLOWS, SENDERS
+def add_months(
+    db,
+    worker_id=WORKER,
+    inflows=None,
+    *,
+    months=None,
+    senders=None,
+):
+    for year_month, inflow, sender_count in zip(
+        months or MONTHS,
+        inflows or INFLOWS,
+        senders or SENDERS,
     ):
         db.add(
             WorkerMonthlyEvidence(
                 worker_id=worker_id,
                 year_month=year_month,
                 upi_inflow=inflow,
-                upi_unique_senders=senders,
+                upi_unique_senders=sender_count,
             )
         )
     db.commit()
@@ -160,6 +172,9 @@ def add_profile(db, worker_id=WORKER, features=None):
     return profile
 
 
+IST = ZoneInfo("Asia/Kolkata")
+
+
 def payload(**overrides):
     data = {
         "worker_id": WORKER,
@@ -174,6 +189,32 @@ def payload(**overrides):
     }
     data.update(overrides)
     return data
+
+
+def recent_month_keys(count=6):
+    """Complete past months, excluding the current (possibly partial) month."""
+    current_month = datetime.now(IST).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    return [
+        _subtract_months(current_month, offset).strftime("%Y-%m")
+        for offset in reversed(range(1, count + 1))
+    ]
+
+
+def sms_item(text, when):
+    return {"text": text, "received_at": when.isoformat()}
+
+
+def seed_recent_upi(db, *, inflow=32000.0, senders=14):
+    months = recent_month_keys(6)
+    add_months(
+        db,
+        inflows=[inflow] * 6,
+        months=months,
+        senders=[senders] * 6,
+    )
+    return months
 
 
 def seed_full(db, *, risk_features=None, add_risk=True):
@@ -243,14 +284,17 @@ def test_recommendation_stated_overstated_needs_more_evidence():
     assert result["reasons"] == ["Stated income exceeds evidence."]
 
 
-def test_recommendation_unavailable_risk_needs_more_evidence():
+def test_recommendation_unavailable_risk_uses_evidence_and_affordability():
     result = recommend(
         fake_evidence(),
         {"available": False, "reason": "No risk profile."},
         {"proposed_emi": 1000, "max_affordable_emi": 5000},
     )
-    assert result["code"] == NEEDS_MORE_EVIDENCE
-    assert result["reasons"] == ["No risk profile."]
+    assert result["code"] == PROCEED_TO_UNDERWRITING
+    assert any(
+        "No credit-history profile available" in caveat
+        for caveat in result["caveats"]
+    )
 
 
 def test_recommendation_unaffordable_emi_wins_before_high_band():
@@ -385,10 +429,7 @@ def test_verify_returns_503_when_risk_artifacts_unavailable(
 # ---------------------------------------------------------------------------
 def test_verify_success_shape_and_safety(client, db_session):
     seed_full(db_session)
-    response = client.post(
-        "/api/v1/verify",
-        json=payload(sms_log=["Rs.5,000 credited via UPI on 01-01-2025"]),
-    )
+    response = client.post("/api/v1/verify", json=payload())
     assert response.status_code == 200
     body = response.json()
     assert body["verification_id"].startswith("VRF-")
@@ -397,7 +438,9 @@ def test_verify_success_shape_and_safety(client, db_session):
     assert body["evidence"]["months"] == 6
     assert body["risk_signal"]["available"] is True
     assert body["risk_signal"]["band"] in {"LOW", "MEDIUM", "HIGH"}
+    assert body["risk_signal"]["display_priority"] == "primary"
     assert body["recommendation"]["code"] == PROCEED_TO_UNDERWRITING
+    assert body["sms_summary"]["received"] == 0
     assert "does not set interest rates" in body["disclaimer"]
     assert_no_forbidden_keys(body)
 
@@ -418,22 +461,36 @@ def test_verify_uses_stored_monthly_evidence_not_record_aggregate(client, db_ses
     assert body["evidence"]["months"] == 6
 
 
-def test_verify_sms_is_ignored_without_dates(client, db_session):
-    seed_full(db_session)
+def test_verify_sms_used_alongside_database_upi(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    months = seed_recent_upi(db_session)
+    add_profile(db_session)
+    month = months[-1]
+    received_at = datetime.strptime(month, "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
     response = client.post(
         "/api/v1/verify",
         json=payload(
-            sms_log=[
-                "Rs.10,000 credited via UPI on 01-01-2025",
-                "Rs.9,000 credited via UPI on 01-02-2025",
-            ]
+            sms_log=[sms_item("Rs.10,000 credited via UPI", received_at)]
         ),
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["evidence"]["provenance"]["sms"] == "ignored_no_dates"
-    assert "parser" in body["sms_ignored_reason"]
+    assert body["evidence"]["provenance"]["sms"] == "client_supplied_unverified"
+    assert body["sms_ignored_reason"] is None
+    assert body["sms_summary"]["used"] == 1
+    assert body["sms_summary"]["monthly_credits"][month] == 10000.0
     assert body["evidence"]["months"] == 6
+    assert any(
+        flag["code"] == "UNVERIFIED_SMS"
+        for flag in body["evidence"]["flags"]
+    )
+    assert not any(
+        flag["code"] == "SOURCES_DISAGREE"
+        for flag in body["evidence"]["flags"]
+    )
 
 
 def test_verify_aggregate_fallback_is_labelled_and_triggers_short_history(
@@ -465,14 +522,19 @@ def test_verify_no_evidence_is_insufficient_with_no_affordability(
     assert body["affordability"]["max_affordable_emi"] is None
 
 
-def test_verify_no_risk_profile_returns_unavailable_signal(client, db_session):
+def test_verify_no_risk_profile_proceeds_with_caveat(client, db_session):
     seed_full(db_session, add_risk=False)
     response = client.post("/api/v1/verify", json=payload())
     assert response.status_code == 200
     body = response.json()
     assert body["risk_signal"]["available"] is False
     assert body["risk_signal"]["reason"]
-    assert body["recommendation"]["code"] == NEEDS_MORE_EVIDENCE
+    assert body["risk_signal"]["display_priority"] == "secondary"
+    assert body["recommendation"]["code"] == PROCEED_TO_UNDERWRITING
+    assert any(
+        "No credit-history profile available" in caveat
+        for caveat in body["recommendation"]["caveats"]
+    )
 
 
 def test_verify_high_risk_profile_recommends_manual_review(client, db_session):
@@ -516,6 +578,391 @@ def test_verify_requested_emi_above_affordability(client, db_session):
     assert response.status_code == 200
     body = response.json()
     assert body["recommendation"]["code"] == NOT_AFFORDABLE_AT_REQUESTED_EMI
+
+
+# ---------------------------------------------------------------------------
+# SMS evidence: request validation
+# ---------------------------------------------------------------------------
+def test_plain_string_sms_item_returns_clear_422(client, db_session):
+    seed_full(db_session)
+    sentinel = "RAW-ERROR-SENTINEL-9876543210"
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(sms_log=[f"{sentinel} Rs.500 credited via UPI"]),
+    )
+    assert response.status_code == 422
+    detail = str(response.json())
+    assert "object" in detail
+    assert "received_at" in detail
+    assert sentinel not in response.text
+
+
+def test_sms_text_longer_than_500_chars_rejected(client, db_session):
+    seed_full(db_session)
+    sentinel = "RAW-ERROR-SENTINEL-123456789012"
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(
+            sms_log=[
+                sms_item(
+                    sentinel + " Rs.500 credited " + ("x" * 500),
+                    datetime.now(timezone.utc) - timedelta(days=1),
+                )
+            ]
+        ),
+    )
+    assert response.status_code == 422
+    assert sentinel not in response.text
+
+
+def test_more_than_300_sms_messages_rejected(client, db_session):
+    seed_full(db_session)
+    when = datetime.now(timezone.utc) - timedelta(days=1)
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(sms_log=[sms_item("Rs.500 credited", when)] * 301),
+    )
+    assert response.status_code == 422
+    assert "at most 300" in str(response.json())
+
+
+# ---------------------------------------------------------------------------
+# SMS evidence: dropping, deduplication and counting
+# ---------------------------------------------------------------------------
+def test_future_sms_is_dropped_and_counted(client, db_session):
+    seed_full(db_session)
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(sms_log=[sms_item("Rs.500 credited via UPI", future)]),
+    )
+    assert response.status_code == 200
+    summary = response.json()["sms_summary"]
+    assert summary["received"] == 1
+    assert summary["used"] == 0
+    assert summary["dropped_by_reason"]["future_received_at"] == 1
+    assert response.json()["sms_ignored_reason"]
+
+
+def test_sms_older_than_12_months_is_dropped_and_counted(client, db_session):
+    seed_full(db_session)
+    old = _subtract_months(datetime.now(timezone.utc), 13)
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(sms_log=[sms_item("Rs.500 credited via UPI", old)]),
+    )
+    assert response.status_code == 200
+    summary = response.json()["sms_summary"]
+    assert summary["received"] == 1
+    assert summary["used"] == 0
+    assert summary["dropped_by_reason"]["older_than_12_months"] == 1
+
+
+def test_debit_and_unparseable_sms_are_ignored_and_counted(client, db_session):
+    seed_full(db_session)
+    when = datetime.strptime(recent_month_keys(1)[0], "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(
+            sms_log=[
+                sms_item("Rs.500 debited from A/c XX1234", when),
+                sms_item("Your OTP is 123456", when),
+            ]
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    summary = body["sms_summary"]
+    assert summary["received"] == 2
+    assert summary["used"] == 0
+    assert summary["dropped_by_reason"]["debit"] == 1
+    assert summary["dropped_by_reason"]["unparseable"] == 1
+    assert body["sms_ignored_reason"]
+
+
+def test_duplicate_sms_is_counted_once(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    months = seed_recent_upi(db_session)
+    add_profile(db_session)
+    when = datetime.strptime(months[-1], "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
+    item = sms_item("Rs.12,000 credited via UPI", when)
+    response = client.post("/api/v1/verify", json=payload(sms_log=[item, item]))
+    assert response.status_code == 200
+    summary = response.json()["sms_summary"]
+    assert summary["received"] == 2
+    assert summary["used"] == 1
+    assert summary["dropped_by_reason"]["duplicate"] == 1
+    assert summary["monthly_credits"][months[-1]] == 12000.0
+
+
+def test_sms_summary_counts_add_up(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    months = seed_recent_upi(db_session)
+    add_profile(db_session)
+    when = datetime.strptime(months[-1], "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
+    valid = sms_item("Rs.10,000 credited via UPI", when)
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(
+            sms_log=[
+                valid,
+                valid,
+                sms_item("Rs.500 debited from A/c", when),
+                sms_item("No amount here", when),
+                sms_item(
+                    "Rs.1,000 credited via UPI",
+                    datetime.now(timezone.utc) + timedelta(days=1),
+                ),
+                sms_item(
+                    "Rs.1,000 credited via UPI",
+                    _subtract_months(datetime.now(timezone.utc), 13),
+                ),
+            ]
+        ),
+    )
+    assert response.status_code == 200
+    summary = response.json()["sms_summary"]
+    assert summary["received"] == 6
+    assert summary["used"] == 1
+    assert summary["dropped"] == 5
+    assert sum(summary["dropped_by_reason"].values()) == summary["dropped"]
+    assert (
+        summary["received"]
+        == summary["used"] + summary["dropped"]
+    )
+
+
+def test_sms_groups_by_ist_month_boundary(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    months = recent_month_keys(6)
+    older_key, previous_key = months[-2], months[-1]
+    add_months(
+        db_session,
+        inflows=[100000.0, 100000.0],
+        months=[older_key, previous_key],
+        senders=[14, 14],
+    )
+    add_profile(db_session)
+    previous_first = datetime.strptime(previous_key, "%Y-%m").replace(
+        tzinfo=IST
+    )
+    older_month_end = previous_first - timedelta(minutes=30)
+    previous_month_start = previous_first + timedelta(minutes=15)
+
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(
+            sms_log=[
+                sms_item("Rs.1,111 credited via UPI", older_month_end),
+                sms_item("Rs.2,222 credited via UPI", previous_month_start),
+            ]
+        ),
+    )
+    assert response.status_code == 200
+    credits = response.json()["sms_summary"]["monthly_credits"]
+    assert credits[older_key] == 1111.0
+    assert credits[previous_key] == 2222.0
+
+
+# ---------------------------------------------------------------------------
+# SMS evidence: anti-inflation rules
+# ---------------------------------------------------------------------------
+def test_sms_larger_than_upi_is_clipped(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    months = seed_recent_upi(db_session)
+    add_profile(db_session)
+    when = datetime.strptime(months[-1], "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(
+            sms_log=[sms_item("Rs.999,999 credited via UPI", when)]
+        ),
+    )
+    assert response.status_code == 200
+    clipped = response.json()["sms_summary"]["clipped_months"]
+    assert len(clipped) == 1
+    assert clipped[0]["month"] == months[-1]
+    assert clipped[0]["sms_total"] == 999999.0
+    assert clipped[0]["upi_total"] == 32000.0
+    assert clipped[0]["used_total"] == 32000.0
+
+
+def test_sms_month_without_upi_evidence_passes_unclipped(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    seed_recent_upi(db_session)
+    add_profile(db_session)
+    extra_month = recent_month_keys(7)[0]
+    when = datetime.strptime(extra_month, "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
+
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(
+            sms_log=[sms_item("Rs.50,000 credited via UPI", when)]
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sms_summary"]["monthly_credits"][extra_month] == 50000.0
+    assert body["sms_summary"]["clipped_months"] == []
+    assert body["evidence"]["provenance"]["sms"] == "client_supplied_unverified"
+    assert not any(
+        flag["code"] == "SOURCES_DISAGREE"
+        for flag in body["evidence"]["flags"]
+    )
+
+
+def test_fabricated_huge_sms_does_not_raise_income_or_recommendation(
+    client, db_session
+):
+    add_consent(db_session)
+    add_record(db_session)
+    months = seed_recent_upi(db_session)
+    add_profile(db_session)
+
+    baseline = client.post("/api/v1/verify", json=payload()).json()
+    sms_log = []
+    for month in months:
+        when = datetime.strptime(month, "%Y-%m").replace(
+            day=10, hour=12, tzinfo=IST
+        )
+        sms_log.append(sms_item("Rs.999999 credited via UPI", when))
+        sms_log.append(sms_item("Rs.9,99,999 credited via UPI", when))
+    with_sms = client.post(
+        "/api/v1/verify", json=payload(sms_log=sms_log)
+    ).json()
+
+    assert with_sms["income"] == baseline["income"]
+    assert with_sms["recommendation"]["code"] == baseline["recommendation"]["code"]
+    assert with_sms["income"]["low"] == baseline["income"]["low"]
+    assert with_sms["income"]["mid"] == baseline["income"]["mid"]
+    assert len(with_sms["sms_summary"]["clipped_months"]) == 6
+
+
+def test_sms_only_worker_is_flagged_capped_and_needs_more_evidence(
+    client, db_session
+):
+    add_consent(db_session)
+    add_record(db_session, aggregate=None, sender_count=None)
+    add_profile(db_session)
+    sms_log = []
+    for month in recent_month_keys(6):
+        when = datetime.strptime(month, "%Y-%m").replace(
+            day=10, hour=12, tzinfo=IST
+        )
+        sms_log.append(sms_item("Rs.32,000 credited via UPI", when))
+
+    response = client.post("/api/v1/verify", json=payload(sms_log=sms_log))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["evidence"]["provenance"] == {
+        "upi": "none",
+        "sms": "client_supplied_unverified",
+    }
+    assert any(
+        flag["code"] == "UNVERIFIED_EVIDENCE_ONLY"
+        for flag in body["evidence"]["flags"]
+    )
+    assert body["evidence"]["confidence_level"] == "MEDIUM"
+    assert body["evidence"]["confidence_capped"] is True
+    assert body["recommendation"]["code"] == NEEDS_MORE_EVIDENCE
+    assert "income rests only on client-supplied, unverified SMS" in (
+        body["recommendation"]["reasons"][0]
+    )
+
+
+def test_recommendation_sms_only_rule_runs_before_missing_risk():
+    result = recommend(
+        fake_evidence(flags=[{"code": "UNVERIFIED_EVIDENCE_ONLY"}]),
+        {"available": False},
+        {"proposed_emi": 1000, "max_affordable_emi": 5000},
+    )
+    assert result["code"] == NEEDS_MORE_EVIDENCE
+    assert "income rests only on client-supplied, unverified SMS" in result[
+        "reasons"
+    ][0]
+
+
+# ---------------------------------------------------------------------------
+# SMS evidence: privacy, display priority and determinism
+# ---------------------------------------------------------------------------
+def test_raw_sms_text_never_stored(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    months = seed_recent_upi(db_session)
+    add_profile(db_session)
+    sentinel = "RAW-SMS-SENTINEL-PHONE-9876543210"
+    when = datetime.strptime(months[-1], "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
+    response = client.post(
+        "/api/v1/verify",
+        json=payload(sms_log=[sms_item(f"{sentinel} Rs.500 credited", when)]),
+    )
+    assert response.status_code == 200
+    assert sentinel not in response.text
+
+    stored = (
+        db_session.query(VerificationResultRecord)
+        .filter_by(id=response.json()["verification_id"])
+        .one()
+    )
+    assert sentinel not in str(stored.result)
+
+
+def test_display_priority_secondary_for_insufficient_evidence(client, db_session):
+    add_consent(db_session)
+    add_record(db_session, aggregate=None, sender_count=None)
+    add_profile(db_session)
+    response = client.post("/api/v1/verify", json=payload())
+    assert response.status_code == 200
+    risk = response.json()["risk_signal"]
+    assert risk["display_priority"] == "secondary"
+    assert "insufficient" in risk["display_note"].lower()
+
+
+def test_verification_is_deterministic_with_sms(client, db_session):
+    add_consent(db_session)
+    add_record(db_session)
+    months = seed_recent_upi(db_session)
+    add_profile(db_session)
+    when = datetime.strptime(months[-1], "%Y-%m").replace(
+        day=10, hour=12, tzinfo=IST
+    )
+    request_body = payload(
+        sms_log=[sms_item("Rs.10,000 credited via UPI", when)]
+    )
+    first = client.post("/api/v1/verify", json=request_body).json()
+    second = client.post("/api/v1/verify", json=request_body).json()
+
+    for key in (
+        "income",
+        "expenses",
+        "surplus_conservative",
+        "evidence",
+        "affordability",
+        "risk_signal",
+        "recommendation",
+        "sms_summary",
+        "model_version",
+        "engine_version",
+        "sms_ignored_reason",
+    ):
+        assert first[key] == second[key]
 
 
 # ---------------------------------------------------------------------------

@@ -11,10 +11,29 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MAX_MONEY_VALUE = 1_000_000_000.0  # Request sanity bound, not a credit policy threshold.
 MAX_HOUSEHOLD_SIZE = 50  # Request sanity bound.
 MAX_OCCUPATION_LENGTH = 100
-MAX_SMS_MESSAGES = 1_000  # Request sanity bound.
-MAX_SMS_MESSAGE_LENGTH = 5_000
+MAX_SMS_MESSAGES = 300  # Request-size assumption; larger batches are rejected.
+MAX_SMS_MESSAGE_LENGTH = 500  # Assumption: one bank SMS fits comfortably in 500 chars.
 MIN_TENURE_MONTHS = 1
 MAX_TENURE_MONTHS = 120
+
+
+class SMSMessage(BaseModel):
+    """One client-supplied SMS with its client-supplied receipt timestamp."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    text: str = Field(min_length=1, max_length=MAX_SMS_MESSAGE_LENGTH)
+    received_at: datetime
+
+    @field_validator("received_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "received_at must include a timezone offset (ISO-8601), for example "
+                "2026-01-31T23:30:00+05:30"
+            )
+        return value
 
 
 class VerifyRequest(BaseModel):
@@ -22,6 +41,7 @@ class VerifyRequest(BaseModel):
 
     model_config = ConfigDict(
         extra="forbid",
+        hide_input_in_errors=True,
         json_schema_extra={
             "example": {
                 "worker_id": "WRK-10024",
@@ -52,7 +72,9 @@ class VerifyRequest(BaseModel):
     occupation_type: Optional[str] = Field(
         default=None, max_length=MAX_OCCUPATION_LENGTH
     )
-    sms_log: Optional[List[str]] = Field(default=None, max_length=MAX_SMS_MESSAGES)
+    sms_log: Optional[List[SMSMessage]] = Field(
+        default=None, max_length=MAX_SMS_MESSAGES
+    )
     proposed_emi: Optional[float] = Field(
         default=None, ge=0.0, le=MAX_MONEY_VALUE
     )
@@ -80,16 +102,25 @@ class VerifyRequest(BaseModel):
             cleaned[key] = float(amount)
         return cleaned
 
-    @field_validator("sms_log")
+    @field_validator("sms_log", mode="before")
     @classmethod
-    def validate_sms_log(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+    def validate_sms_log(cls, value: object) -> object:
         if value is None:
             return None
+        if not isinstance(value, list):
+            return value
+        if len(value) > MAX_SMS_MESSAGES:
+            raise ValueError(
+                f"sms_log accepts at most {MAX_SMS_MESSAGES} messages per request"
+            )
         for message in value:
-            if not isinstance(message, str):
-                raise ValueError("sms_log entries must be strings")
-            if len(message) > MAX_SMS_MESSAGE_LENGTH:
-                raise ValueError("sms_log entry exceeds the maximum message length")
+            if isinstance(message, str):
+                raise ValueError(
+                    "Each sms_log item must be an object with 'text' (max "
+                    f"{MAX_SMS_MESSAGE_LENGTH} chars) and 'received_at' (ISO-8601 "
+                    "datetime with a timezone offset). Plain strings are no longer "
+                    "accepted."
+                )
         return value
 
 
@@ -125,6 +156,22 @@ class AffordabilitySummary(BaseModel):
     max_affordable_emi: Optional[float]
 
 
+class SmsClippedMonth(BaseModel):
+    month: str
+    sms_total: float
+    upi_total: float
+    used_total: float
+
+
+class SmsSummary(BaseModel):
+    received: int = 0
+    used: int = 0
+    dropped: int = 0
+    dropped_by_reason: Dict[str, int] = Field(default_factory=dict)
+    clipped_months: List[SmsClippedMonth] = Field(default_factory=list)
+    monthly_credits: Dict[str, float] = Field(default_factory=dict)
+
+
 class RiskFactor(BaseModel):
     feature: str
     label: str
@@ -135,6 +182,8 @@ class RiskFactor(BaseModel):
 
 class RiskSignalSummary(BaseModel):
     available: bool
+    display_priority: str = "primary"
+    display_note: Optional[str] = None
     band: Optional[str] = None
     risk_score_0_100: Optional[float] = None
     reference_population_pd: Optional[float] = None
@@ -166,6 +215,7 @@ class VerifyResponse(BaseModel):
     affordability: AffordabilitySummary
     risk_signal: RiskSignalSummary
     recommendation: RecommendationSummary
+    sms_summary: SmsSummary = Field(default_factory=SmsSummary)
     model_version: str
     engine_version: str
     sms_ignored_reason: Optional[str] = None

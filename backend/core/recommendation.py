@@ -17,6 +17,7 @@ PROCEED_TO_UNDERWRITING = "PROCEED_TO_UNDERWRITING"
 # Named policy labels (no numeric assumption is needed for these rule inputs).
 NO_EVIDENCE_FLAG = "NO_EVIDENCE"
 STATED_OVERSTATED_FLAG = "STATED_OVERSTATED"
+UNVERIFIED_EVIDENCE_ONLY_FLAG = "UNVERIFIED_EVIDENCE_ONLY"
 SINGLE_SOURCE_FLAG = "SINGLE_SOURCE"
 LOW_CONFIDENCE = "LOW"
 MEDIUM_CONFIDENCE = "MEDIUM"
@@ -24,6 +25,14 @@ HIGH_RISK_BAND = "HIGH"
 LIMITED_RELIABILITY = "LIMITED"
 CLIENT_SUPPLIED_SMS_PROVENANCE = "client_supplied_unverified"
 
+UNVERIFIED_SMS_ONLY_REASON = (
+    "income rests only on client-supplied, unverified SMS; a verifiable source such "
+    "as a bank statement or account-aggregator data is needed"
+)
+CAVEAT_RISK_SIGNAL_UNAVAILABLE = (
+    "No credit-history profile available; this recommendation rests on income "
+    "verification and affordability only"
+)
 CAVEAT_MEDIUM_CONFIDENCE = "Evidence confidence is MEDIUM; supporting documents may be requested."
 CAVEAT_EXPENSES_INCOMPLETE = (
     "Monthly expenses are incomplete, so the conservative surplus may be overstated."
@@ -32,7 +41,10 @@ CAVEAT_SINGLE_SOURCE = "Only one evidence source was available; independent cros
 CAVEAT_LIMITED_RELIABILITY = (
     "The reference-population risk signal has LIMITED reliability for this worker profile."
 )
-CAVEAT_UNVERIFIED_SMS = "SMS evidence is client-supplied and unverified."
+CAVEAT_UNVERIFIED_SMS = (
+    "SMS evidence is client-supplied and unverified; used only to cross-check "
+    "database evidence"
+)
 
 
 def _has_flag(evidence_result: Any, code: str) -> bool:
@@ -44,6 +56,24 @@ def _flag_message(evidence_result: Any, code: str) -> str | None:
         if flag.get("code") == code:
             return flag.get("message")
     return None
+
+
+def _risk_caveats(risk: Dict[str, Any]) -> List[str]:
+    caveats: List[str] = []
+    if not risk.get("available", False):
+        caveats.append(CAVEAT_RISK_SIGNAL_UNAVAILABLE)
+    if risk.get("reliability") == LIMITED_RELIABILITY:
+        caveats.append(CAVEAT_LIMITED_RELIABILITY)
+    return caveats
+
+
+def _sms_caveat(affordability: Dict[str, Any]) -> List[str]:
+    if (
+        affordability.get("sms_provenance") == CLIENT_SUPPLIED_SMS_PROVENANCE
+        and affordability.get("upi_provenance", "database") == "database"
+    ):
+        return [CAVEAT_UNVERIFIED_SMS]
+    return []
 
 
 def recommend(
@@ -68,7 +98,7 @@ def recommend(
                 f"Evidence confidence is LOW ({evidence_result.evidence_confidence_score}/100); "
                 "more transaction history or corroborating evidence is needed."
             ],
-            "caveats": [],
+            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
         }
 
     if _has_flag(evidence_result, STATED_OVERSTATED_FLAG):
@@ -79,17 +109,14 @@ def recommend(
                 message
                 or "Stated income is materially above the verified evidence, so more evidence is needed."
             ],
-            "caveats": [],
+            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
         }
 
-    if not risk.get("available", False):
+    if _has_flag(evidence_result, UNVERIFIED_EVIDENCE_ONLY_FLAG):
         return {
             "code": NEEDS_MORE_EVIDENCE,
-            "reasons": [
-                risk.get("reason")
-                or "A repayment-risk signal is unavailable for this worker, so more evidence is needed."
-            ],
-            "caveats": [],
+            "reasons": [UNVERIFIED_SMS_ONLY_REASON],
+            "caveats": _risk_caveats(risk),
         }
 
     proposed_emi = affordability.get("proposed_emi")
@@ -106,7 +133,7 @@ def recommend(
                 f"affordable EMI of \u20b9{float(max_affordable_emi):,.2f} under the "
                 "conservative affordability test."
             ],
-            "caveats": [],
+            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
         }
 
     if risk.get("band") == HIGH_RISK_BAND:
@@ -115,7 +142,7 @@ def recommend(
             "reasons": [
                 "The reference-population repayment-risk band is HIGH; manual review is recommended."
             ],
-            "caveats": [],
+            "caveats": _risk_caveats(risk) + _sms_caveat(affordability),
         }
 
     reasons.append(
@@ -130,6 +157,8 @@ def recommend(
         caveats.append(CAVEAT_EXPENSES_INCOMPLETE)
     if _has_flag(evidence_result, SINGLE_SOURCE_FLAG):
         caveats.append(CAVEAT_SINGLE_SOURCE)
+    if not risk.get("available", False):
+        caveats.append(CAVEAT_RISK_SIGNAL_UNAVAILABLE)
     if risk.get("reliability") == LIMITED_RELIABILITY:
         caveats.append(CAVEAT_LIMITED_RELIABILITY)
     if affordability.get("sms_provenance") == CLIENT_SUPPLIED_SMS_PROVENANCE:
